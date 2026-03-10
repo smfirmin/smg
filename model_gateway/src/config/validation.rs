@@ -465,11 +465,11 @@ impl ConfigValidator {
                 });
             }
 
-            if !seen_classes.insert(rule.class.as_str()) {
+            if !seen_classes.insert(rule.class.trim()) {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "semantic_routing.policies contains duplicate class '{}'",
-                        rule.class
+                        rule.class.trim()
                     ),
                 });
             }
