@@ -1167,6 +1167,117 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_semantic_routing_duplicate_classes_after_trim() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.semantic_routing = Some(SemanticRoutingConfig {
+            mode: SemanticRoutingMode::Shadow,
+            confidence_threshold: 0.5,
+            default_route: SemanticRouteTarget {
+                model: "gpt-default".to_string(),
+                router_hint: None,
+            },
+            policies: vec![
+                SemanticRoutingRule {
+                    class: "coding".to_string(),
+                    min_confidence: Some(0.6),
+                    route: SemanticRouteTarget {
+                        model: "gpt-code".to_string(),
+                        router_hint: None,
+                    },
+                },
+                SemanticRoutingRule {
+                    class: " coding ".to_string(),
+                    min_confidence: Some(0.8),
+                    route: SemanticRouteTarget {
+                        model: "gpt-code-v2".to_string(),
+                        router_hint: None,
+                    },
+                },
+            ],
+        });
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(err.to_string().contains("duplicate class"));
+        }
+    }
+
+    #[test]
+    fn test_validate_semantic_routing_rule_min_confidence_bounds() {
+        for invalid_confidence in [1.5_f32, -0.1_f32] {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".to_string()],
+                },
+                PolicyConfig::Random,
+            );
+
+            config.semantic_routing = Some(SemanticRoutingConfig {
+                mode: SemanticRoutingMode::Shadow,
+                confidence_threshold: 0.5,
+                default_route: SemanticRouteTarget {
+                    model: "gpt-default".to_string(),
+                    router_hint: None,
+                },
+                policies: vec![SemanticRoutingRule {
+                    class: "qa".to_string(),
+                    min_confidence: Some(invalid_confidence),
+                    route: SemanticRouteTarget {
+                        model: "gpt-small".to_string(),
+                        router_hint: None,
+                    },
+                }],
+            });
+
+            let result = ConfigValidator::validate(&config);
+            assert!(result.is_err());
+            if let Err(err) = result {
+                assert!(err.to_string().contains("min_confidence"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_semantic_routing_rule_route_model_required() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.semantic_routing = Some(SemanticRoutingConfig {
+            mode: SemanticRoutingMode::Shadow,
+            confidence_threshold: 0.5,
+            default_route: SemanticRouteTarget {
+                model: "gpt-default".to_string(),
+                router_hint: None,
+            },
+            policies: vec![SemanticRoutingRule {
+                class: "qa".to_string(),
+                min_confidence: Some(0.4),
+                route: SemanticRouteTarget {
+                    model: "".to_string(),
+                    router_hint: None,
+                },
+            }],
+        });
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(err.to_string().contains("route.model"));
+        }
+    }
+
+    #[test]
     fn test_validate_semantic_routing_confidence_bounds() {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
