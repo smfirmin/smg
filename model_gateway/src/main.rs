@@ -200,7 +200,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
-    /// Path to semantic routing YAML config file
+    /// Path to semantic routing YAML config file.
+    ///
+    /// When set, this file is loaded during startup and merged into router
+    /// config via `RouterConfigBuilder::maybe_semantic_routing`.
     #[arg(long, help_heading = "Routing Policy")]
     semantic_routing_config: Option<String>,
 
@@ -820,6 +823,9 @@ impl CliArgs {
         }
     }
 
+    /// Load semantic routing configuration from a YAML file path, if provided.
+    ///
+    /// Returns `Ok(None)` when the CLI flag is not set.
     fn load_semantic_routing_config(&self) -> ConfigResult<Option<SemanticRoutingConfig>> {
         match &self.semantic_routing_config {
             Some(path) => {

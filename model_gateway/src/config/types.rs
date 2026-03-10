@@ -17,6 +17,10 @@ pub struct RouterConfig {
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     pub policy: PolicyConfig,
+    /// Optional semantic routing policy configuration.
+    ///
+    /// When `None`, semantic routing is disabled and existing routing behavior is unchanged.
+    /// When set, runtime behavior depends on [`SemanticRoutingConfig::mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_routing: Option<SemanticRoutingConfig>,
     pub host: String,
@@ -387,12 +391,17 @@ pub struct SemanticRoutingRule {
 }
 
 /// Semantic routing policy configuration.
+///
+/// This block is intentionally declarative so routing behavior can be changed
+/// without code updates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SemanticRoutingConfig {
     /// Evaluation/enforcement mode.
     #[serde(default)]
     pub mode: SemanticRoutingMode,
     /// Global minimum classifier confidence required to apply a class route.
+    ///
+    /// Individual rules may override this via [`SemanticRoutingRule::min_confidence`].
     #[serde(default = "default_semantic_confidence_threshold")]
     pub confidence_threshold: f32,
     /// Fallback route when confidence is below threshold or no rule matches.
@@ -401,6 +410,8 @@ pub struct SemanticRoutingConfig {
     pub policies: Vec<SemanticRoutingRule>,
 }
 
+/// Default minimum confidence used when semantic routing is enabled and no
+/// explicit threshold is configured.
 fn default_semantic_confidence_threshold() -> f32 {
     0.6
 }

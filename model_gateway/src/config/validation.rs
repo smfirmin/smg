@@ -436,6 +436,13 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate semantic routing configuration invariants.
+    ///
+    /// Ensures policy rules are present, class labels are unique/non-empty, and
+    /// confidence values are bounded to the valid range.
+    ///
+    /// This validator only checks config shape and bounds; it does not validate
+    /// that referenced model IDs exist at runtime.
     fn validate_semantic_routing(semantic_routing: &SemanticRoutingConfig) -> ConfigResult<()> {
         if semantic_routing.policies.is_empty() {
             return Err(ConfigError::ValidationFailed {

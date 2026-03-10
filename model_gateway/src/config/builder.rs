@@ -104,6 +104,10 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Set semantic routing configuration.
+    ///
+    /// This enables semantic routing config on the built [`RouterConfig`].
+    /// Behavior is controlled by the configured semantic routing mode.
     pub fn semantic_routing_config(mut self, semantic_routing: SemanticRoutingConfig) -> Self {
         self.config.semantic_routing = Some(semantic_routing);
         self
@@ -513,11 +517,17 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Conditionally set semantic routing configuration.
+    ///
+    /// Passing `Some(config)` sets [`RouterConfig::semantic_routing`]. Passing
+    /// `None` is a no-op and preserves any existing value.
     pub fn maybe_semantic_routing(
         mut self,
         semantic_routing: Option<SemanticRoutingConfig>,
     ) -> Self {
-        self.config.semantic_routing = semantic_routing;
+        if let Some(semantic_routing) = semantic_routing {
+            self.config.semantic_routing = Some(semantic_routing);
+        }
         self
     }
 
@@ -893,5 +903,37 @@ mod tests {
         assert!(matches!(semantic_routing.mode, SemanticRoutingMode::Shadow));
         assert_eq!(semantic_routing.policies.len(), 1);
         assert_eq!(semantic_routing.default_route.model, "gpt-default");
+    }
+
+    #[test]
+    fn test_maybe_semantic_routing_none_preserves_existing_config() {
+        let config = RouterConfigBuilder::new()
+            .regular_mode(vec!["http://worker1:8000".to_string()])
+            .round_robin_policy()
+            .semantic_routing_config(SemanticRoutingConfig {
+                mode: SemanticRoutingMode::Shadow,
+                confidence_threshold: 0.7,
+                default_route: SemanticRouteTarget {
+                    model: "gpt-default".to_string(),
+                    router_hint: None,
+                },
+                policies: vec![SemanticRoutingRule {
+                    class: "coding".to_string(),
+                    min_confidence: Some(0.9),
+                    route: SemanticRouteTarget {
+                        model: "gpt-code".to_string(),
+                        router_hint: Some("http-regular".to_string()),
+                    },
+                }],
+            })
+            .maybe_semantic_routing(None)
+            .build()
+            .unwrap();
+
+        let semantic_routing = config.semantic_routing.expect("semantic routing missing");
+        assert!(matches!(semantic_routing.mode, SemanticRoutingMode::Shadow));
+        assert_eq!(semantic_routing.default_route.model, "gpt-default");
+        assert_eq!(semantic_routing.policies.len(), 1);
+        assert_eq!(semantic_routing.policies[0].class, "coding");
     }
 }
