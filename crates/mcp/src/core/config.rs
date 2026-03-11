@@ -2,7 +2,10 @@
 //!
 //! Defines configuration structures for MCP servers, transports, proxies, and inventory.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 pub use rmcp::model::{Prompt, RawResource, Tool};
 use serde::{Deserialize, Serialize};
@@ -226,9 +229,17 @@ impl McpServerConfig {
     /// Validate the server configuration.
     ///
     /// Returns an error if:
+    /// - `name` is blank or contains leading/trailing whitespace
     /// - `builtin_type` is set but `builtin_tool_name` is not
     /// - `builtin_tool_name` is set but `builtin_type` is not
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        let trimmed_name = self.name.trim();
+        if trimmed_name.is_empty() || trimmed_name != self.name {
+            return Err(ConfigValidationError::InvalidServerName {
+                server: self.name.clone(),
+            });
+        }
+
         match (&self.builtin_type, &self.builtin_tool_name) {
             (Some(_), None) => Err(ConfigValidationError::MissingBuiltinToolName {
                 server: self.name.clone(),
@@ -245,10 +256,14 @@ impl McpServerConfig {
 /// Configuration validation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigValidationError {
+    /// `name` must be non-blank and canonical (no leading/trailing whitespace).
+    InvalidServerName { server: String },
     /// `builtin_type` is set but `builtin_tool_name` is missing.
     MissingBuiltinToolName { server: String },
     /// `builtin_tool_name` is set but `builtin_type` is missing.
     MissingBuiltinType { server: String, tool_name: String },
+    /// Multiple servers configured with the same `name`.
+    DuplicateServerName { server: String },
     /// Multiple servers configured for the same `builtin_type`.
     DuplicateBuiltinType {
         builtin_type: BuiltinToolType,
@@ -276,6 +291,12 @@ pub enum ConfigValidationError {
 impl fmt::Display for ConfigValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConfigValidationError::InvalidServerName { server } => {
+                write!(
+                    f,
+                    "server name '{server}' must not be blank or contain leading/trailing whitespace"
+                )
+            }
             ConfigValidationError::MissingBuiltinToolName { server } => {
                 write!(
                     f,
@@ -287,6 +308,9 @@ impl fmt::Display for ConfigValidationError {
                     f,
                     "server '{server}': builtin_tool_name '{tool_name}' is set but builtin_type is missing"
                 )
+            }
+            ConfigValidationError::DuplicateServerName { server } => {
+                write!(f, "duplicate MCP server name '{server}'")
             }
             ConfigValidationError::DuplicateBuiltinType {
                 builtin_type,
@@ -770,19 +794,22 @@ impl McpConfig {
     ///
     /// Checks:
     /// - Each server's builtin_type/builtin_tool_name pairing
+    /// - No duplicate server names
     /// - No duplicate builtin_type across servers
     /// - Semantic search and resolution settings are internally consistent
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         let mut builtin_types: HashMap<BuiltinToolType, &str> = HashMap::new();
-        let configured_servers: std::collections::HashSet<&str> = self
-            .servers
-            .iter()
-            .map(|server| server.name.as_str())
-            .collect();
+        let mut configured_servers = HashSet::new();
 
         for server in &self.servers {
             // Validate individual server config
             server.validate()?;
+
+            if !configured_servers.insert(server.name.as_str()) {
+                return Err(ConfigValidationError::DuplicateServerName {
+                    server: server.name.clone(),
+                });
+            }
 
             // Check for duplicate builtin_type
             if let Some(builtin_type) = &server.builtin_type {
@@ -825,7 +852,7 @@ impl McpConfig {
             return Err(ConfigValidationError::MissingServerPrecedence);
         }
 
-        let mut seen_precedence = std::collections::HashSet::new();
+        let mut seen_precedence = HashSet::new();
         for server in &self.resolution.server_precedence {
             let trimmed = server.trim();
             if trimmed.is_empty() {
@@ -1618,6 +1645,54 @@ servers:
     }
 
     #[test]
+    fn test_validate_rejects_blank_server_name() {
+        let config = McpServerConfig {
+            name: "   ".to_string(),
+            transport: McpTransport::Sse {
+                url: "http://localhost:3000/sse".to_string(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: None,
+            builtin_tool_name: None,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::InvalidServerName { .. }
+        ));
+        assert!(err.to_string().contains("leading/trailing whitespace"));
+    }
+
+    #[test]
+    fn test_validate_rejects_server_name_with_surrounding_whitespace() {
+        let config = McpServerConfig {
+            name: " brave ".to_string(),
+            transport: McpTransport::Sse {
+                url: "http://localhost:3000/sse".to_string(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: None,
+            builtin_tool_name: None,
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::InvalidServerName { .. }
+        ));
+        assert!(err.to_string().contains(" brave "));
+    }
+
+    #[test]
     fn test_validate_missing_builtin_type() {
         let config = McpServerConfig {
             name: "brave".to_string(),
@@ -1721,6 +1796,48 @@ servers:
         assert!(err.to_string().contains("brave1"));
         assert!(err.to_string().contains("brave2"));
         assert!(err.to_string().contains("web_search_preview"));
+    }
+
+    #[test]
+    fn test_mcp_config_validate_duplicate_server_name() {
+        let config = McpConfig {
+            servers: vec![
+                McpServerConfig {
+                    name: "brave".to_string(),
+                    transport: McpTransport::Sse {
+                        url: "http://localhost:3000/sse".to_string(),
+                        token: None,
+                        headers: HashMap::new(),
+                    },
+                    proxy: None,
+                    required: false,
+                    tools: None,
+                    builtin_type: None,
+                    builtin_tool_name: None,
+                },
+                McpServerConfig {
+                    name: "brave".to_string(),
+                    transport: McpTransport::Sse {
+                        url: "http://localhost:3001/sse".to_string(),
+                        token: None,
+                        headers: HashMap::new(),
+                    },
+                    proxy: None,
+                    required: false,
+                    tools: None,
+                    builtin_type: None,
+                    builtin_tool_name: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::DuplicateServerName { .. }
+        ));
+        assert!(err.to_string().contains("brave"));
     }
 
     #[test]
