@@ -60,6 +60,23 @@ impl Default for ToolInventory {
 }
 
 impl ToolInventory {
+    /// Remove a tool entry from all non-server indices.
+    fn remove_entry_from_indices(&self, qualified: &QualifiedToolName) {
+        let tool_name = qualified.tool_name();
+
+        if let Some((_, entry)) = self.tools_by_qualified.remove(qualified) {
+            if let Some(mut cat_set) = self.tools_by_category.get_mut(&entry.category) {
+                cat_set.remove(qualified);
+            }
+        }
+
+        if let Some(mut entry) = self.tools_by_simple_name.get_mut(tool_name) {
+            entry.retain(|q| q != qualified);
+        }
+        self.tools_by_simple_name
+            .remove_if(tool_name, |_, v| v.is_empty());
+    }
+
     /// Returns first registered tool on collision. Use `get_tool_qualified()` for specific server.
     pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
         let qualified_names = self.tools_by_simple_name.get(tool_name)?;
@@ -307,6 +324,17 @@ impl ToolInventory {
             .collect()
     }
 
+    /// List prompts for a specific server as (name, prompt) tuples.
+    pub fn list_prompts_for_server(&self, server_key: &str) -> Vec<(String, Prompt)> {
+        self.prompts
+            .iter()
+            .filter_map(|entry| {
+                let (name, cached) = entry.pair();
+                (cached.server_name == server_key).then_some((name.clone(), cached.prompt.clone()))
+            })
+            .collect()
+    }
+
     /// Get a resource by URI, returning the server and resource info.
     pub fn get_resource(&self, resource_uri: &str) -> Option<(String, RawResource)> {
         self.resources
@@ -350,26 +378,23 @@ impl ToolInventory {
             .collect()
     }
 
+    /// List resources for a specific server as (uri, resource) tuples.
+    pub fn list_resources_for_server(&self, server_key: &str) -> Vec<(String, RawResource)> {
+        self.resources
+            .iter()
+            .filter_map(|entry| {
+                let (uri, cached) = entry.pair();
+                (cached.server_name == server_key).then_some((uri.clone(), cached.resource.clone()))
+            })
+            .collect()
+    }
+
     /// Clear all cached items for a server. Uses server index for O(tools_per_server) removal.
     pub fn clear_server_tools(&self, server_key: &str) {
         if let Some((_, tool_names)) = self.tools_by_server.remove(server_key) {
             for tool_name in tool_names {
                 let qualified = QualifiedToolName::new(server_key, &tool_name);
-
-                // Get entry before removing to access metadata
-                if let Some((_, entry)) = self.tools_by_qualified.remove(&qualified) {
-                    // Remove from category index
-                    if let Some(mut cat_set) = self.tools_by_category.get_mut(&entry.category) {
-                        cat_set.remove(&qualified);
-                    }
-                }
-
-                // Remove from simple name index
-                if let Some(mut entry) = self.tools_by_simple_name.get_mut(&tool_name) {
-                    entry.retain(|q| q != &qualified);
-                }
-                self.tools_by_simple_name
-                    .remove_if(&tool_name, |_, v| v.is_empty());
+                self.remove_entry_from_indices(&qualified);
             }
         }
 
@@ -390,26 +415,13 @@ impl ToolInventory {
             .collect();
 
         for qualified in alias_entries_to_remove {
-            let tool_name = qualified.tool_name().to_string();
-            let alias_server_key = qualified.server_key().to_string();
+            self.remove_entry_from_indices(&qualified);
 
-            if let Some((_, entry)) = self.tools_by_qualified.remove(&qualified) {
-                if let Some(mut cat_set) = self.tools_by_category.get_mut(&entry.category) {
-                    cat_set.remove(&qualified);
-                }
-            }
-
-            if let Some(mut entry) = self.tools_by_simple_name.get_mut(&tool_name) {
-                entry.retain(|q| q != &qualified);
-            }
-            self.tools_by_simple_name
-                .remove_if(&tool_name, |_, v| v.is_empty());
-
-            if let Some(mut server_tools) = self.tools_by_server.get_mut(&alias_server_key) {
-                server_tools.remove(&tool_name);
+            if let Some(mut server_tools) = self.tools_by_server.get_mut(qualified.server_key()) {
+                server_tools.remove(qualified.tool_name());
             }
             self.tools_by_server
-                .remove_if(&alias_server_key, |_, v| v.is_empty());
+                .remove_if(qualified.server_key(), |_, v| v.is_empty());
         }
 
         // Remove aliases that point to this server
@@ -622,6 +634,25 @@ mod tests {
     }
 
     #[test]
+    fn test_list_prompts_for_server() {
+        let inventory = ToolInventory::new();
+        inventory.insert_prompt(
+            "prompt-a".to_string(),
+            "server-a".to_string(),
+            create_test_prompt("prompt-a"),
+        );
+        inventory.insert_prompt(
+            "prompt-b".to_string(),
+            "server-b".to_string(),
+            create_test_prompt("prompt-b"),
+        );
+
+        let prompts = inventory.list_prompts_for_server("server-a");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "prompt-a");
+    }
+
+    #[test]
     fn test_resource_operations() {
         let inventory = ToolInventory::new();
         let resource = create_test_resource("file:///test.txt");
@@ -640,6 +671,25 @@ mod tests {
         let (server_name, retrieved_resource) = result.unwrap();
         assert_eq!(server_name, "server1");
         assert_eq!(retrieved_resource.uri, "file:///test.txt");
+    }
+
+    #[test]
+    fn test_list_resources_for_server() {
+        let inventory = ToolInventory::new();
+        inventory.insert_resource(
+            "file:///a.txt".to_string(),
+            "server-a".to_string(),
+            create_test_resource("file:///a.txt"),
+        );
+        inventory.insert_resource(
+            "file:///b.txt".to_string(),
+            "server-b".to_string(),
+            create_test_resource("file:///b.txt"),
+        );
+
+        let resources = inventory.list_resources_for_server("server-a");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].0, "file:///a.txt");
     }
 
     #[tokio::test]

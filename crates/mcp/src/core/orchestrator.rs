@@ -821,13 +821,7 @@ impl McpOrchestrator {
         tool_inventory: &ToolInventory,
         server_key: &str,
     ) -> Vec<(String, Prompt)> {
-        tool_inventory
-            .list_prompts()
-            .into_iter()
-            .filter_map(|(prompt_name, prompt_server, prompt)| {
-                (prompt_server == server_key).then_some((prompt_name, prompt))
-            })
-            .collect()
+        tool_inventory.list_prompts_for_server(server_key)
     }
 
     /// Returns cached resources for a specific server.
@@ -835,13 +829,7 @@ impl McpOrchestrator {
         tool_inventory: &ToolInventory,
         server_key: &str,
     ) -> Vec<(String, RawResource)> {
-        tool_inventory
-            .list_resources()
-            .into_iter()
-            .filter_map(|(resource_uri, resource_server, resource)| {
-                (resource_server == server_key).then_some((resource_uri, resource))
-            })
-            .collect()
+        tool_inventory.list_resources_for_server(server_key)
     }
 
     /// Fetch a full server inventory snapshot.
