@@ -216,7 +216,7 @@ Example:
 
 ```yaml
 semantic_search:
-  enabled: false
+  enabled: true
   refresh_on_startup: false
   refresh_interval: 60
   min_description_chars: 16
