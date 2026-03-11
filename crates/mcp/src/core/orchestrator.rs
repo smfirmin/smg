@@ -1350,7 +1350,9 @@ impl McpOrchestrator {
                     return Err(McpError::ToolDenied(entry.tool_name().to_string()));
                 }
                 self.metrics.record_approval_granted();
-                let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                let result = self
+                    .execute_tool_with_reconnect(entry, arguments, request_ctx)
+                    .await?;
                 Ok(ApprovalExecutionResult::Success(result))
             }
             ApprovalOutcome::Pending {
@@ -1369,7 +1371,9 @@ impl McpOrchestrator {
                 match rx.await {
                     Ok(ApprovalDecision::Approved) => {
                         self.metrics.record_approval_granted();
-                        let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                        let result = self
+                            .execute_tool_with_reconnect(entry, arguments, request_ctx)
+                            .await?;
                         Ok(ApprovalExecutionResult::Success(result))
                     }
                     Ok(ApprovalDecision::Denied { reason }) => {
@@ -1385,6 +1389,7 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         arguments: Value,
+        request_ctx: &McpRequestContext<'_>,
     ) -> McpResult<CallToolResult> {
         let server_name = entry.server_key();
 
@@ -1394,7 +1399,10 @@ impl McpOrchestrator {
             .get(server_name)
             .map(|e| Arc::clone(&e.client));
 
-        match self.execute_tool_impl(entry, arguments.clone()).await {
+        match self
+            .execute_tool_impl(entry, arguments.clone(), Some(request_ctx))
+            .await
+        {
             Ok(result) => Ok(result),
             Err(McpError::ServerDisconnected(name)) => {
                 // Acquire/Create the mutex for this server to prevent concurrent reconnects
@@ -1421,7 +1429,9 @@ impl McpOrchestrator {
                             "Server '{}' already reconnected by another task, retrying call",
                             name
                         );
-                        return self.execute_tool_impl(entry, arguments).await;
+                        return self
+                            .execute_tool_impl(entry, arguments, Some(request_ctx))
+                            .await;
                     }
                 }
 
@@ -1446,7 +1456,8 @@ impl McpOrchestrator {
                     .await?;
 
                 // Retry execution after successful reconnection
-                self.execute_tool_impl(entry, arguments).await
+                self.execute_tool_impl(entry, arguments, Some(request_ctx))
+                    .await
             }
             Err(e) => Err(e),
         }
@@ -1457,6 +1468,7 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         mut arguments: Value,
+        request_ctx: Option<&McpRequestContext<'_>>,
     ) -> McpResult<CallToolResult> {
         // Resolve alias if needed
         let (target_server, target_tool) = if let Some(alias) = &entry.alias_target {
@@ -1491,8 +1503,11 @@ impl McpOrchestrator {
             arguments: args_map,
         };
 
+        let handler_ctx = request_ctx.map(|ctx| ctx.handler_context());
+
         // Execute on server
-        self.execute_on_server(&target_server, request).await
+        self.execute_on_server(&target_server, request, handler_ctx)
+            .await
     }
 
     /// Coerce argument types based on tool schema.
@@ -1582,9 +1597,24 @@ impl McpOrchestrator {
         &self,
         server_key: &str,
         request: CallToolRequestParam,
+        handler_ctx: Option<HandlerRequestContext>,
     ) -> McpResult<CallToolResult> {
         if let Some(entry) = self.static_servers.get(server_key) {
-            return entry.client.call_tool(request).await.map_err(|e| match e {
+            let handler = Arc::clone(&entry.handler);
+            let client = Arc::clone(&entry.client);
+            drop(entry);
+
+            let result = if let Some(handler_ctx) = handler_ctx {
+                handler
+                    .run_with_request_context(handler_ctx, || async {
+                        client.call_tool(request).await
+                    })
+                    .await
+            } else {
+                client.call_tool(request).await
+            };
+
+            return result.map_err(|e| match e {
                 // Typed detection for transport-level failures
                 ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
                     McpError::ServerDisconnected(server_key.to_string())
@@ -1651,6 +1681,14 @@ impl McpOrchestrator {
     }
 
     /// Set request context on all static server handlers.
+    ///
+    /// Deprecated: this mutates shared handler state and is not safe for
+    /// concurrent multi-tenant request execution. Prefer per-call context
+    /// propagation through `McpRequestContext`.
+    #[deprecated(
+        since = "2.1.1",
+        note = "use per-call request context propagation via McpRequestContext"
+    )]
     pub fn set_handler_contexts(&self, ctx: &HandlerRequestContext) {
         for entry in self.static_servers.iter() {
             entry.handler.set_request_context(ctx.clone());
@@ -1658,6 +1696,14 @@ impl McpOrchestrator {
     }
 
     /// Clear request context from all static server handlers.
+    ///
+    /// Deprecated: this mutates shared handler state and is not safe for
+    /// concurrent multi-tenant request execution. Prefer per-call context
+    /// propagation through `McpRequestContext`.
+    #[deprecated(
+        since = "2.1.1",
+        note = "use per-call request context propagation via McpRequestContext"
+    )]
     pub fn clear_handler_contexts(&self) {
         for entry in self.static_servers.iter() {
             entry.handler.clear_request_context();
@@ -1925,7 +1971,9 @@ impl McpOrchestrator {
             .ok_or_else(|| McpError::ToolNotFound(format!("{server_key}:{tool_name}")))?;
 
         // Execute directly (approval already handled)
-        let result = self.execute_tool_impl(&entry, arguments.clone()).await?;
+        let result = self
+            .execute_tool_impl(&entry, arguments.clone(), Some(request_ctx))
+            .await?;
 
         // Transform response
         let output = Self::transform_result(
@@ -2074,6 +2122,7 @@ impl<'a> McpRequestContext<'a> {
         // Check dynamic tools first
         let qualified = QualifiedToolName::new(server_key, tool_name);
         if let Some(entry) = self.dynamic_tools.get(&qualified) {
+            let entry = entry.clone();
             return self
                 .execute_dynamic_tool(&entry, arguments, server_label)
                 .await;
@@ -2095,6 +2144,7 @@ impl<'a> McpRequestContext<'a> {
         let client = self
             .dynamic_clients
             .get(entry.server_key())
+            .map(|entry| Arc::clone(entry.value()))
             .ok_or_else(|| McpError::ServerNotFound(entry.server_key().to_string()))?;
 
         let args_map = if let Value::Object(map) = arguments.clone() {
@@ -2108,8 +2158,10 @@ impl<'a> McpRequestContext<'a> {
             arguments: args_map,
         };
 
+        let handler_ctx = self.handler_context();
         let result = client
-            .call_tool(request)
+            .service()
+            .run_with_request_context(handler_ctx, || async { client.call_tool(request).await })
             .await
             .map_err(|e| McpError::ToolExecution(format!("MCP call failed: {e}")))?;
 

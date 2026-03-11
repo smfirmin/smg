@@ -5,7 +5,7 @@
 //! - Tool/resource/prompt list change notifications
 //! - Progress and logging notifications
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use parking_lot::RwLock;
 use rmcp::{
@@ -17,7 +17,7 @@ use rmcp::{
     service::{NotificationContext, RequestContext},
     ClientHandler, RoleClient,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -62,6 +62,7 @@ pub struct SmgClientHandler {
     tool_inventory: Arc<ToolInventory>,
     client_info: ClientInfo,
     request_ctx: Arc<RwLock<Option<HandlerRequestContext>>>,
+    request_ctx_lock: Arc<Mutex<()>>,
     refresh_tx: Option<mpsc::Sender<RefreshRequest>>,
 }
 
@@ -81,6 +82,7 @@ impl SmgClientHandler {
             tool_inventory,
             client_info,
             request_ctx: Arc::new(RwLock::new(None)),
+            request_ctx_lock: Arc::new(Mutex::new(())),
             refresh_tx: None,
         }
     }
@@ -107,6 +109,25 @@ impl SmgClientHandler {
 
     pub fn request_context(&self) -> Option<HandlerRequestContext> {
         self.request_ctx.read().clone()
+    }
+
+    pub async fn run_with_request_context<F, Fut, T>(&self, ctx: HandlerRequestContext, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        struct RequestContextResetGuard<'a>(&'a SmgClientHandler);
+
+        impl Drop for RequestContextResetGuard<'_> {
+            fn drop(&mut self) {
+                self.0.clear_request_context();
+            }
+        }
+
+        let _guard = self.request_ctx_lock.lock().await;
+        self.set_request_context(ctx);
+        let _reset_guard = RequestContextResetGuard(self);
+        f().await
     }
 
     pub fn server_key(&self) -> &str {
@@ -359,6 +380,122 @@ mod tests {
         assert_eq!(retrieved.request_id, "req-1");
 
         handler.clear_request_context();
+        assert!(handler.request_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_with_request_context_scopes_and_clears() {
+        let handler = test_handler();
+        let ctx = HandlerRequestContext::new(
+            "req-1",
+            ApprovalMode::PolicyOnly,
+            TenantContext::new("tenant-1"),
+        );
+
+        let handler_clone = handler.clone();
+        handler
+            .run_with_request_context(ctx.clone(), move || async move {
+                let current = handler_clone.request_context();
+                assert!(current.is_some());
+                assert_eq!(current.unwrap().request_id, "req-1");
+            })
+            .await;
+
+        assert!(handler.request_context().is_none());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test verifies panic unwinding cleanup behavior in spawned task"
+    )]
+    async fn test_run_with_request_context_clears_on_panic() {
+        use std::sync::Arc;
+
+        let handler = Arc::new(test_handler());
+        let panic_handler = Arc::clone(&handler);
+        let panic_task = tokio::spawn(async move {
+            panic_handler
+                .run_with_request_context(
+                    HandlerRequestContext::new(
+                        "req-panic",
+                        ApprovalMode::PolicyOnly,
+                        TenantContext::new("tenant-panic"),
+                    ),
+                    || async {
+                        panic!("intentional panic to verify context cleanup");
+                    },
+                )
+                .await;
+        });
+
+        assert!(panic_task.await.is_err());
+        assert!(handler.request_context().is_none());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test concurrency: spawned tasks are awaited before test exits"
+    )]
+    async fn test_run_with_request_context_serializes_concurrent_calls() {
+        use std::sync::Arc;
+
+        use tokio::sync::oneshot;
+
+        let handler = Arc::new(test_handler());
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+
+        let first_handler = Arc::clone(&handler);
+        let first_task = tokio::spawn(async move {
+            let first_ctx = HandlerRequestContext::new(
+                "req-1",
+                ApprovalMode::PolicyOnly,
+                TenantContext::new("tenant-1"),
+            );
+            first_handler
+                .run_with_request_context(first_ctx, move || async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                })
+                .await;
+        });
+
+        let _ = started_rx.await;
+        assert_eq!(
+            handler.request_context().map(|ctx| ctx.request_id),
+            Some("req-1".to_string())
+        );
+
+        let second_handler = Arc::clone(&handler);
+        let second_task = tokio::spawn(async move {
+            let second_ctx = HandlerRequestContext::new(
+                "req-2",
+                ApprovalMode::PolicyOnly,
+                TenantContext::new("tenant-2"),
+            );
+            let second_handler_clone = Arc::clone(&second_handler);
+            second_handler
+                .run_with_request_context(second_ctx, move || async move {
+                    second_handler_clone
+                        .request_context()
+                        .map(|ctx| ctx.request_id)
+                })
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handler.request_context().map(|ctx| ctx.request_id),
+            Some("req-1".to_string())
+        );
+
+        let _ = release_tx.send(());
+        first_task.await.unwrap();
+
+        let second_context_id = second_task.await.unwrap();
+        assert_eq!(second_context_id.as_deref(), Some("req-2"));
         assert!(handler.request_context().is_none());
     }
 
