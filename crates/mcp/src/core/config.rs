@@ -29,6 +29,14 @@ pub struct McpConfig {
     #[serde(default)]
     pub inventory: InventoryConfig,
 
+    /// Semantic search indexing settings.
+    #[serde(default)]
+    pub semantic_search: SemanticSearchConfig,
+
+    /// Tool name resolution settings.
+    #[serde(default)]
+    pub resolution: ToolResolutionConfig,
+
     /// Approval policy configuration
     /// Default: allow all tools
     #[serde(default)]
@@ -247,6 +255,22 @@ pub enum ConfigValidationError {
         first_server: String,
         second_server: String,
     },
+    /// `confidence_threshold` must be between 0.0 and 1.0 inclusive.
+    InvalidConfidenceThreshold { threshold: String },
+    /// `semantic_search.refresh_interval` must be greater than zero when enabled.
+    InvalidSemanticRefreshInterval,
+    /// `semantic_search.min_description_chars` must be greater than zero when enabled.
+    InvalidMinDescriptionChars,
+    /// Semantic fallback requires semantic indexing to be enabled.
+    SemanticFallbackRequiresSemanticSearch,
+    /// Server precedence conflict policy requires a non-empty precedence list.
+    MissingServerPrecedence,
+    /// Server precedence entries must not be blank.
+    EmptyServerPrecedenceEntry,
+    /// Server precedence entries must be unique.
+    DuplicateServerPrecedenceEntry { server: String },
+    /// Server precedence entries must refer to configured server names.
+    UnknownServerPrecedenceServer { server: String },
 }
 
 impl fmt::Display for ConfigValidationError {
@@ -272,6 +296,54 @@ impl fmt::Display for ConfigValidationError {
                 write!(
                     f,
                     "duplicate builtin_type '{builtin_type}': configured on both '{first_server}' and '{second_server}'"
+                )
+            }
+            ConfigValidationError::InvalidConfidenceThreshold { threshold } => {
+                write!(
+                    f,
+                    "resolution.confidence_threshold must be between 0.0 and 1.0 inclusive, got '{threshold}'"
+                )
+            }
+            ConfigValidationError::InvalidSemanticRefreshInterval => {
+                write!(
+                    f,
+                    "semantic_search.refresh_interval must be greater than 0 when semantic_search is enabled"
+                )
+            }
+            ConfigValidationError::InvalidMinDescriptionChars => {
+                write!(
+                    f,
+                    "semantic_search.min_description_chars must be greater than 0 when semantic_search is enabled"
+                )
+            }
+            ConfigValidationError::SemanticFallbackRequiresSemanticSearch => {
+                write!(
+                    f,
+                    "resolution.fallback_policy requires semantic_search.enabled to be true"
+                )
+            }
+            ConfigValidationError::MissingServerPrecedence => {
+                write!(
+                    f,
+                    "resolution.server_precedence must not be empty when conflict_policy is server_precedence"
+                )
+            }
+            ConfigValidationError::EmptyServerPrecedenceEntry => {
+                write!(
+                    f,
+                    "resolution.server_precedence must not contain blank server names"
+                )
+            }
+            ConfigValidationError::DuplicateServerPrecedenceEntry { server } => {
+                write!(
+                    f,
+                    "resolution.server_precedence contains duplicate server name '{server}'"
+                )
+            }
+            ConfigValidationError::UnknownServerPrecedenceServer { server } => {
+                write!(
+                    f,
+                    "resolution.server_precedence references unknown server '{server}'"
                 )
             }
         }
@@ -478,6 +550,79 @@ pub struct InventoryConfig {
     pub refresh_on_error: bool,
 }
 
+/// Semantic MCP tool indexing configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SemanticSearchConfig {
+    /// Enable semantic indexing and search for discovered MCP tools.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Build or refresh the index during startup discovery.
+    #[serde(default)]
+    pub refresh_on_startup: bool,
+
+    /// Background semantic index refresh interval in seconds.
+    #[serde(default = "default_semantic_refresh_interval")]
+    pub refresh_interval: u64,
+
+    /// Skip indexing very short descriptions to reduce low-signal matches.
+    #[serde(default = "default_min_description_chars")]
+    pub min_description_chars: usize,
+}
+
+/// Resolution behavior when a tool name does not map cleanly to a single tool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolResolutionConfig {
+    /// When semantic fallback is allowed after exact lookup fails.
+    #[serde(default)]
+    pub fallback_policy: SemanticFallbackPolicy,
+
+    /// Minimum confidence required before semantic fallback may resolve a tool.
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f64,
+
+    /// How to handle conflicts between multiple semantic matches.
+    #[serde(default)]
+    pub conflict_policy: ResolutionConflictPolicy,
+
+    /// Which namespace style should be accepted for explicit server-qualified lookup.
+    #[serde(default)]
+    pub namespace_style: ToolNamespaceStyle,
+
+    /// Preferred server ordering when conflict resolution uses precedence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_precedence: Vec<String>,
+}
+
+/// When semantic fallback is permitted during tool resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticFallbackPolicy {
+    #[default]
+    Disabled,
+    OnNoExactMatch,
+}
+
+/// How to resolve multiple semantic candidates with similar scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionConflictPolicy {
+    #[default]
+    Error,
+    HighestScore,
+    ServerPrecedence,
+}
+
+/// Accepted server-qualified tool namespace syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolNamespaceStyle {
+    #[default]
+    ServerColonTool,
+    ServerDotTool,
+    Both,
+}
+
 /// Pre-warm server connections at startup
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WarmupServer {
@@ -513,6 +658,18 @@ fn default_refresh_interval() -> u64 {
     60 // 1 minute
 }
 
+fn default_semantic_refresh_interval() -> u64 {
+    60 // 1 minute
+}
+
+fn default_min_description_chars() -> usize {
+    16
+}
+
+fn default_confidence_threshold() -> f64 {
+    0.82
+}
+
 // Default implementations
 impl Default for McpPoolConfig {
     fn default() -> Self {
@@ -530,6 +687,29 @@ impl Default for InventoryConfig {
             tool_ttl: default_tool_ttl(),
             refresh_interval: default_refresh_interval(),
             refresh_on_error: true,
+        }
+    }
+}
+
+impl Default for SemanticSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            refresh_on_startup: false,
+            refresh_interval: default_semantic_refresh_interval(),
+            min_description_chars: default_min_description_chars(),
+        }
+    }
+}
+
+impl Default for ToolResolutionConfig {
+    fn default() -> Self {
+        Self {
+            fallback_policy: SemanticFallbackPolicy::Disabled,
+            confidence_threshold: default_confidence_threshold(),
+            conflict_policy: ResolutionConflictPolicy::Error,
+            namespace_style: ToolNamespaceStyle::ServerColonTool,
+            server_precedence: Vec::new(),
         }
     }
 }
@@ -591,8 +771,14 @@ impl McpConfig {
     /// Checks:
     /// - Each server's builtin_type/builtin_tool_name pairing
     /// - No duplicate builtin_type across servers
+    /// - Semantic search and resolution settings are internally consistent
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         let mut builtin_types: HashMap<BuiltinToolType, &str> = HashMap::new();
+        let configured_servers: std::collections::HashSet<&str> = self
+            .servers
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect();
 
         for server in &self.servers {
             // Validate individual server config
@@ -608,6 +794,52 @@ impl McpConfig {
                     });
                 }
                 builtin_types.insert(*builtin_type, &server.name);
+            }
+        }
+
+        if self.semantic_search.enabled {
+            if self.semantic_search.refresh_interval == 0 {
+                return Err(ConfigValidationError::InvalidSemanticRefreshInterval);
+            }
+
+            if self.semantic_search.min_description_chars == 0 {
+                return Err(ConfigValidationError::InvalidMinDescriptionChars);
+            }
+        }
+
+        if !(0.0..=1.0).contains(&self.resolution.confidence_threshold) {
+            return Err(ConfigValidationError::InvalidConfidenceThreshold {
+                threshold: self.resolution.confidence_threshold.to_string(),
+            });
+        }
+
+        if self.resolution.fallback_policy != SemanticFallbackPolicy::Disabled
+            && !self.semantic_search.enabled
+        {
+            return Err(ConfigValidationError::SemanticFallbackRequiresSemanticSearch);
+        }
+
+        if self.resolution.conflict_policy == ResolutionConflictPolicy::ServerPrecedence
+            && self.resolution.server_precedence.is_empty()
+        {
+            return Err(ConfigValidationError::MissingServerPrecedence);
+        }
+
+        let mut seen_precedence = std::collections::HashSet::new();
+        for server in &self.resolution.server_precedence {
+            let trimmed = server.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigValidationError::EmptyServerPrecedenceEntry);
+            }
+            if !seen_precedence.insert(trimmed) {
+                return Err(ConfigValidationError::DuplicateServerPrecedenceEntry {
+                    server: trimmed.to_string(),
+                });
+            }
+            if !configured_servers.contains(trimmed) {
+                return Err(ConfigValidationError::UnknownServerPrecedenceServer {
+                    server: trimmed.to_string(),
+                });
             }
         }
 
@@ -635,6 +867,25 @@ mod tests {
         assert_eq!(config.tool_ttl, 300);
         assert_eq!(config.refresh_interval, 60);
         assert!(config.refresh_on_error);
+    }
+
+    #[test]
+    fn test_default_semantic_search_config() {
+        let config = SemanticSearchConfig::default();
+        assert!(!config.enabled);
+        assert!(!config.refresh_on_startup);
+        assert_eq!(config.refresh_interval, 60);
+        assert_eq!(config.min_description_chars, 16);
+    }
+
+    #[test]
+    fn test_default_tool_resolution_config() {
+        let config = ToolResolutionConfig::default();
+        assert_eq!(config.fallback_policy, SemanticFallbackPolicy::Disabled);
+        assert_eq!(config.confidence_threshold, 0.82);
+        assert_eq!(config.conflict_policy, ResolutionConflictPolicy::Error);
+        assert_eq!(config.namespace_style, ToolNamespaceStyle::ServerColonTool);
+        assert!(config.server_precedence.is_empty());
     }
 
     #[test]
@@ -684,6 +935,11 @@ servers:
         assert!(config.servers[0].proxy.is_none()); // Should default to None
         assert_eq!(config.pool.max_connections, 100); // Should use default
         assert_eq!(config.inventory.tool_ttl, 300); // Should use default
+        assert!(!config.semantic_search.enabled); // Should use default
+        assert_eq!(
+            config.resolution.fallback_policy,
+            SemanticFallbackPolicy::Disabled
+        );
     }
 
     #[tokio::test]
@@ -706,6 +962,19 @@ inventory:
   tool_ttl: 600
   refresh_interval: 120
   refresh_on_error: true
+
+semantic_search:
+  enabled: true
+  refresh_on_startup: true
+  refresh_interval: 90
+  min_description_chars: 24
+
+resolution:
+  fallback_policy: on_no_exact_match
+  confidence_threshold: 0.9
+  conflict_policy: server_precedence
+  namespace_style: both
+  server_precedence: ["required-server", "optional-server"]
 
 # Static servers
 servers:
@@ -746,6 +1015,28 @@ warmup:
         // Check inventory config
         assert_eq!(config.inventory.tool_ttl, 600);
         assert_eq!(config.inventory.refresh_interval, 120);
+
+        // Check semantic search config
+        assert!(config.semantic_search.enabled);
+        assert!(config.semantic_search.refresh_on_startup);
+        assert_eq!(config.semantic_search.refresh_interval, 90);
+        assert_eq!(config.semantic_search.min_description_chars, 24);
+
+        // Check resolution config
+        assert_eq!(
+            config.resolution.fallback_policy,
+            SemanticFallbackPolicy::OnNoExactMatch
+        );
+        assert_eq!(config.resolution.confidence_threshold, 0.9);
+        assert_eq!(
+            config.resolution.conflict_policy,
+            ResolutionConflictPolicy::ServerPrecedence
+        );
+        assert_eq!(config.resolution.namespace_style, ToolNamespaceStyle::Both);
+        assert_eq!(
+            config.resolution.server_precedence,
+            vec!["required-server".to_string(), "optional-server".to_string()]
+        );
 
         // Check servers
         assert_eq!(config.servers.len(), 2);
@@ -792,6 +1083,11 @@ servers:
         assert!(config.servers[0].proxy.is_none()); // New field defaults to None
         assert!(config.proxy.is_none()); // New field defaults to None
         assert!(config.warmup.is_empty()); // New field defaults to empty
+        assert!(!config.semantic_search.enabled);
+        assert_eq!(
+            config.resolution.fallback_policy,
+            SemanticFallbackPolicy::Disabled
+        );
     }
 
     #[tokio::test]
@@ -1425,6 +1721,301 @@ servers:
         assert!(err.to_string().contains("brave1"));
         assert!(err.to_string().contains("brave2"));
         assert!(err.to_string().contains("web_search_preview"));
+    }
+
+    #[test]
+    fn test_semantic_fallback_policy_serde() {
+        let policies = vec![
+            (SemanticFallbackPolicy::Disabled, "\"disabled\""),
+            (
+                SemanticFallbackPolicy::OnNoExactMatch,
+                "\"on_no_exact_match\"",
+            ),
+        ];
+
+        for (policy, expected) in policies {
+            let serialized = serde_json::to_string(&policy).unwrap();
+            assert_eq!(serialized, expected);
+
+            let deserialized: SemanticFallbackPolicy = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, policy);
+        }
+    }
+
+    #[test]
+    fn test_resolution_conflict_policy_serde() {
+        let policies = vec![
+            (ResolutionConflictPolicy::Error, "\"error\""),
+            (ResolutionConflictPolicy::HighestScore, "\"highest_score\""),
+            (
+                ResolutionConflictPolicy::ServerPrecedence,
+                "\"server_precedence\"",
+            ),
+        ];
+
+        for (policy, expected) in policies {
+            let serialized = serde_json::to_string(&policy).unwrap();
+            assert_eq!(serialized, expected);
+
+            let deserialized: ResolutionConflictPolicy = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, policy);
+        }
+    }
+
+    #[test]
+    fn test_tool_namespace_style_serde() {
+        let styles = vec![
+            (ToolNamespaceStyle::ServerColonTool, "\"server_colon_tool\""),
+            (ToolNamespaceStyle::ServerDotTool, "\"server_dot_tool\""),
+            (ToolNamespaceStyle::Both, "\"both\""),
+        ];
+
+        for (style, expected) in styles {
+            let serialized = serde_json::to_string(&style).unwrap();
+            assert_eq!(serialized, expected);
+
+            let deserialized: ToolNamespaceStyle = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, style);
+        }
+    }
+
+    #[test]
+    fn test_validate_invalid_confidence_threshold() {
+        let config = McpConfig {
+            resolution: ToolResolutionConfig {
+                confidence_threshold: 1.2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::InvalidConfidenceThreshold { .. }
+        ));
+        assert!(err.to_string().contains("confidence_threshold"));
+    }
+
+    #[test]
+    fn test_validate_semantic_fallback_requires_semantic_search() {
+        let config = McpConfig {
+            semantic_search: SemanticSearchConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            resolution: ToolResolutionConfig {
+                fallback_policy: SemanticFallbackPolicy::OnNoExactMatch,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::SemanticFallbackRequiresSemanticSearch
+        ));
+    }
+
+    #[test]
+    fn test_validate_server_precedence_requires_values() {
+        let config = McpConfig {
+            resolution: ToolResolutionConfig {
+                conflict_policy: ResolutionConflictPolicy::ServerPrecedence,
+                server_precedence: Vec::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::MissingServerPrecedence
+        ));
+    }
+
+    #[test]
+    fn test_validate_server_precedence_rejects_blank_names() {
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "brave".to_string(),
+                transport: McpTransport::Sse {
+                    url: "http://localhost:3000/sse".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+            }],
+            resolution: ToolResolutionConfig {
+                server_precedence: vec!["   ".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::EmptyServerPrecedenceEntry
+        ));
+    }
+
+    #[test]
+    fn test_validate_server_precedence_rejects_duplicates() {
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "brave".to_string(),
+                transport: McpTransport::Sse {
+                    url: "http://localhost:3000/sse".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+            }],
+            resolution: ToolResolutionConfig {
+                server_precedence: vec!["brave".to_string(), "brave".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::DuplicateServerPrecedenceEntry { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_server_precedence_rejects_unknown_servers() {
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "brave".to_string(),
+                transport: McpTransport::Sse {
+                    url: "http://localhost:3000/sse".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+            }],
+            resolution: ToolResolutionConfig {
+                server_precedence: vec!["filesystem".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::UnknownServerPrecedenceServer { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_server_precedence_accepts_known_unique_servers() {
+        let config = McpConfig {
+            servers: vec![
+                McpServerConfig {
+                    name: "brave".to_string(),
+                    transport: McpTransport::Sse {
+                        url: "http://localhost:3000/sse".to_string(),
+                        token: None,
+                        headers: HashMap::new(),
+                    },
+                    proxy: None,
+                    required: false,
+                    tools: None,
+                    builtin_type: None,
+                    builtin_tool_name: None,
+                },
+                McpServerConfig {
+                    name: "filesystem".to_string(),
+                    transport: McpTransport::Sse {
+                        url: "http://localhost:3001/sse".to_string(),
+                        token: None,
+                        headers: HashMap::new(),
+                    },
+                    proxy: None,
+                    required: false,
+                    tools: None,
+                    builtin_type: None,
+                    builtin_tool_name: None,
+                },
+            ],
+            resolution: ToolResolutionConfig {
+                server_precedence: vec!["brave".to_string(), "filesystem".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_semantic_refresh_interval_must_be_positive() {
+        let config = McpConfig {
+            semantic_search: SemanticSearchConfig {
+                enabled: true,
+                refresh_interval: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::InvalidSemanticRefreshInterval
+        ));
+    }
+
+    #[test]
+    fn test_validate_min_description_chars_must_be_positive() {
+        let config = McpConfig {
+            semantic_search: SemanticSearchConfig {
+                enabled: true,
+                min_description_chars: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigValidationError::InvalidMinDescriptionChars
+        ));
+    }
+
+    #[test]
+    fn test_validate_disabled_semantic_search_allows_zero_tuning_values() {
+        let config = McpConfig {
+            semantic_search: SemanticSearchConfig {
+                enabled: false,
+                refresh_interval: 0,
+                min_description_chars: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
