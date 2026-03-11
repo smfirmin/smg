@@ -12,6 +12,8 @@ dependencies = [
     "vllm>=0.16.0",
     "grpcio>=1.78.0",
     "grpcio-reflection>=1.78.0",
+    "msgspec",
+    "pyzmq>=25.0.0",
 ]
 readme = "README.md"
 license = { text = "Apache-2.0" }

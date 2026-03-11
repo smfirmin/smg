@@ -1,0 +1,153 @@
+import asyncio
+import time
+
+import pytest
+
+pytest.importorskip("torch")
+
+from vllm.config.kv_events import KVEventsConfig
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    EventPublisherFactory,
+    KVEventBatch,
+)
+from vllm.utils.network_utils import get_open_ports_list, get_tcp_uri
+
+from smg_grpc_servicer.vllm.kv_events import VllmKvEventBridge
+
+
+def _make_config() -> KVEventsConfig:
+    ports = get_open_ports_list(2)
+    ports.sort()
+    return KVEventsConfig(
+        enable_kv_cache_events=True,
+        publisher="zmq",
+        endpoint=get_tcp_uri("127.0.0.1", ports[0]).replace("127.0.0.1", "*"),
+        replay_endpoint=get_tcp_uri("127.0.0.1", ports[1]).replace("127.0.0.1", "*"),
+        buffer_steps=128,
+        topic="kv-test",
+    )
+
+
+def test_kv_event_bridge_replays_and_streams_live_events():
+    async def run() -> None:
+        config = _make_config()
+        publisher = EventPublisherFactory.create(config, 0)
+        bridge = VllmKvEventBridge(config, data_parallel_size=1)
+        bridge.start()
+
+        try:
+            await asyncio.sleep(0.2)
+
+            publisher.publish(
+                KVEventBatch(
+                    ts=time.time(),
+                    events=[
+                        BlockStored(
+                            block_hashes=[101, 102],
+                            parent_block_hash=100,
+                            token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+                            block_size=4,
+                            lora_id=7,
+                            medium="GPU",
+                            lora_name="adapter",
+                        )
+                    ],
+                    data_parallel_rank=0,
+                )
+            )
+
+            await asyncio.sleep(0.3)
+
+            stream = bridge.subscribe(0)
+            first = await anext(stream)
+            assert first.sequence_number == 1
+            assert first.dp_rank == 0
+            assert len(first.events) == 1
+            assert first.events[0].HasField("stored")
+            assert first.events[0].stored.parent_block_hash == 100
+            assert [block.block_hash for block in first.events[0].stored.blocks] == [101, 102]
+            assert [list(block.token_ids) for block in first.events[0].stored.blocks] == [
+                [1, 2, 3, 4],
+                [5, 6, 7, 8],
+            ]
+            assert [block.lora_id for block in first.events[0].stored.blocks] == [7, 7]
+
+            publisher.publish(
+                KVEventBatch(
+                    ts=time.time(),
+                    events=[
+                        BlockRemoved(block_hashes=[101], medium="GPU"),
+                        AllBlocksCleared(),
+                    ],
+                    data_parallel_rank=0,
+                )
+            )
+
+            second = await asyncio.wait_for(anext(stream), timeout=2)
+            assert second.sequence_number == 2
+            assert second.dp_rank == 0
+            assert second.events[0].HasField("removed")
+            assert list(second.events[0].removed.block_hashes) == [101]
+            assert second.events[1].HasField("cleared")
+
+            await stream.aclose()
+        finally:
+            await bridge.shutdown()
+            publisher.shutdown()
+
+    asyncio.run(run())
+
+
+def test_kv_event_bridge_assigns_global_sequence_numbers_across_dp_ranks():
+    async def run() -> None:
+        config = _make_config()
+        publisher_rank0 = EventPublisherFactory.create(config, 0)
+        publisher_rank1 = EventPublisherFactory.create(config, 1)
+        bridge = VllmKvEventBridge(config, data_parallel_size=2)
+        bridge.start()
+
+        try:
+            await asyncio.sleep(0.2)
+
+            publisher_rank0.publish(
+                KVEventBatch(
+                    ts=time.time(),
+                    events=[
+                        BlockStored(
+                            block_hashes=[201],
+                            parent_block_hash=None,
+                            token_ids=[9, 10, 11, 12],
+                            block_size=4,
+                            lora_id=None,
+                            medium="GPU",
+                            lora_name=None,
+                        )
+                    ],
+                    data_parallel_rank=0,
+                )
+            )
+            publisher_rank1.publish(
+                KVEventBatch(
+                    ts=time.time(),
+                    events=[BlockRemoved(block_hashes=[301], medium="GPU")],
+                    data_parallel_rank=1,
+                )
+            )
+
+            stream = bridge.subscribe(0)
+            batch_a = await asyncio.wait_for(anext(stream), timeout=2)
+            batch_b = await asyncio.wait_for(anext(stream), timeout=2)
+
+            assert [batch_a.sequence_number, batch_b.sequence_number] == [1, 2]
+            assert {batch_a.dp_rank, batch_b.dp_rank} == {0, 1}
+
+            await stream.aclose()
+        finally:
+            await bridge.shutdown()
+            publisher_rank0.shutdown()
+            publisher_rank1.shutdown()
+
+    asyncio.run(run())
