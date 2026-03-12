@@ -15,7 +15,10 @@ from vllm.distributed.kv_events import (
 )
 from vllm.utils.network_utils import get_open_ports_list, get_tcp_uri
 
-from smg_grpc_servicer.vllm.kv_events import VllmKvEventBridge
+from smg_grpc_servicer.vllm.kv_events import (
+    UnsupportedKvEventLayoutError,
+    VllmKvEventBridge,
+)
 
 
 def _make_config() -> KVEventsConfig:
@@ -149,5 +152,84 @@ def test_kv_event_bridge_assigns_global_sequence_numbers_across_dp_ranks():
             await bridge.shutdown()
             publisher_rank0.shutdown()
             publisher_rank1.shutdown()
+
+    asyncio.run(run())
+
+
+def test_kv_event_bridge_replays_from_head_when_requested_sequence_is_in_future():
+    async def run() -> None:
+        config = _make_config()
+        publisher = EventPublisherFactory.create(config, 0)
+        bridge = VllmKvEventBridge(config, data_parallel_size=1)
+        bridge.start()
+
+        try:
+            stream = bridge.subscribe(25)
+            await asyncio.sleep(0.2)
+
+            publisher.publish(
+                KVEventBatch(
+                    ts=time.time(),
+                    events=[
+                        BlockStored(
+                            block_hashes=[401],
+                            parent_block_hash=None,
+                            token_ids=[1, 2, 3, 4],
+                            block_size=4,
+                            lora_id=None,
+                            medium="GPU",
+                            lora_name=None,
+                        )
+                    ],
+                    data_parallel_rank=0,
+                )
+            )
+
+            first = await asyncio.wait_for(anext(stream), timeout=2)
+            assert first.sequence_number == 1
+            assert first.dp_rank == 0
+
+            await stream.aclose()
+        finally:
+            await bridge.shutdown()
+            publisher.shutdown()
+
+    asyncio.run(run())
+
+
+def test_kv_event_bridge_fails_closed_on_unsupported_blockstored_layout():
+    async def run() -> None:
+        config = _make_config()
+        publisher = EventPublisherFactory.create(config, 0)
+        bridge = VllmKvEventBridge(config, data_parallel_size=1)
+        bridge.start()
+
+        try:
+            await asyncio.sleep(0.2)
+
+            publisher.publish(
+                KVEventBatch(
+                    ts=time.time(),
+                    events=[
+                        BlockStored(
+                            block_hashes=[501, 502],
+                            parent_block_hash=None,
+                            token_ids=[1, 2, 3, 4],
+                            block_size=4,
+                            lora_id=None,
+                            medium="GPU",
+                            lora_name=None,
+                        )
+                    ],
+                    data_parallel_rank=0,
+                )
+            )
+
+            stream = bridge.subscribe(0)
+            with pytest.raises(UnsupportedKvEventLayoutError):
+                await asyncio.wait_for(anext(stream), timeout=2)
+        finally:
+            await bridge.shutdown()
+            publisher.shutdown()
 
     asyncio.run(run())

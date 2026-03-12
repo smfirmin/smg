@@ -13,7 +13,10 @@ from collections.abc import AsyncGenerator
 import grpc
 import torch
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
-from smg_grpc_servicer.vllm.kv_events import VllmKvEventBridge
+from smg_grpc_servicer.vllm.kv_events import (
+    UnsupportedKvEventLayoutError,
+    VllmKvEventBridge,
+)
 from transformers import BatchFeature
 from vllm import SamplingParams, TextPrompt, TokensPrompt
 from vllm.logger import init_logger
@@ -336,6 +339,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 yield batch
         except asyncio.CancelledError:
             raise
+        except UnsupportedKvEventLayoutError as e:
+            logger.exception("Unsupported KV event layout in SubscribeKvEvents")
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
         except Exception as e:
             logger.exception("Error in SubscribeKvEvents")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))

@@ -27,6 +27,10 @@ logger = init_logger(__name__)
 _REPLAY_TIMEOUT_MS = 100
 
 
+class UnsupportedKvEventLayoutError(RuntimeError):
+    """Raised when a vLLM KV event cannot be translated losslessly."""
+
+
 def _connect_endpoint(endpoint: str | None, rank: int) -> str | None:
     """Convert a publisher bind endpoint into a subscriber connect endpoint."""
     offset = ZmqEventPublisher.offset_endpoint_port(endpoint, rank)
@@ -38,6 +42,27 @@ def _connect_endpoint(endpoint: str | None, rank: int) -> str | None:
 
 
 def _chunk_token_ids(token_ids: list[int], block_size: int, num_blocks: int) -> list[list[int]]:
+    if num_blocks == 0:
+        if token_ids:
+            raise UnsupportedKvEventLayoutError(
+                "Received BlockStored with tokens but no block hashes"
+            )
+        return []
+    if block_size <= 0:
+        raise UnsupportedKvEventLayoutError(
+            f"Received BlockStored with invalid block_size={block_size}"
+        )
+
+    expected_tokens = block_size * num_blocks
+    if len(token_ids) != expected_tokens:
+        raise UnsupportedKvEventLayoutError(
+            "Unsupported BlockStored layout from vLLM: "
+            f"expected {expected_tokens} token ids for {num_blocks} blocks "
+            f"of size {block_size}, got {len(token_ids)}. "
+            "This usually indicates null blocks in the cached range, which "
+            "cannot be translated losslessly without per-block token ranges."
+        )
+
     chunks = []
     for i in range(num_blocks):
         start = i * block_size
@@ -150,22 +175,10 @@ class VllmKvEventBridge:
         next_seq = max(0, int(start_sequence_number))
 
         async with self._condition:
-            if self._buffer:
-                oldest = self._buffer[0].sequence_number
-                if next_seq and next_seq < oldest:
-                    logger.warning(
-                        "Requested KV event replay from expired sequence %s; oldest=%s",
-                        next_seq,
-                        oldest,
-                    )
-                    next_seq = oldest
-                replay = [
-                    batch
-                    for batch in self._buffer
-                    if batch.sequence_number >= next_seq
-                ]
-            else:
-                replay = []
+            next_seq = self._normalize_requested_sequence_locked(next_seq)
+            replay = [
+                batch for batch in self._buffer if batch.sequence_number >= next_seq
+            ]
 
         for batch in replay:
             yield batch
@@ -178,13 +191,17 @@ class VllmKvEventBridge:
                     or self._closed
                     or (
                         self._buffer
-                        and self._buffer[-1].sequence_number >= next_seq
+                        and (
+                            self._buffer[-1].sequence_number >= next_seq
+                            or next_seq >= self._next_sequence_number
+                        )
                     )
                 )
                 if self._fatal_error is not None:
-                    raise RuntimeError("KV event bridge stopped") from self._fatal_error
+                    raise self._fatal_error
                 if self._closed:
                     return
+                next_seq = self._normalize_requested_sequence_locked(next_seq)
                 live = [
                     batch
                     for batch in self._buffer
@@ -253,6 +270,33 @@ class VllmKvEventBridge:
                 sock.close(linger=0)
             async with self._condition:
                 self._condition.notify_all()
+
+    def _normalize_requested_sequence_locked(self, next_seq: int) -> int:
+        if not self._buffer:
+            return next_seq
+
+        oldest = self._buffer[0].sequence_number
+        latest = self._buffer[-1].sequence_number
+
+        if next_seq and next_seq < oldest:
+            logger.warning(
+                "Requested KV event replay from expired sequence %s; oldest=%s",
+                next_seq,
+                oldest,
+            )
+            return oldest
+
+        if next_seq and next_seq > latest:
+            logger.warning(
+                "Requested KV event replay from future sequence %s; latest=%s. "
+                "Assuming producer restart and replaying from oldest=%s",
+                next_seq,
+                latest,
+                oldest,
+            )
+            return oldest
+
+        return next_seq
 
     async def _replay_rank(self, rank: int, replay: zmq.asyncio.Socket) -> None:
         await replay.send((0).to_bytes(8, "big"))
