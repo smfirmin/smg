@@ -335,6 +335,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
 
         try:
+            # grpc.aio defers headers until the first yield unless they are
+            # sent explicitly. Send them now so tonic callers don't block on
+            # subscribe_kv_events(...).await when the stream is idle.
+            await context.send_initial_metadata(())
             async for batch in self.kv_event_bridge.subscribe(request.start_sequence_number):
                 yield batch
         except asyncio.CancelledError:

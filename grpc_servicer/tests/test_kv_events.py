@@ -19,6 +19,7 @@ from smg_grpc_servicer.vllm.kv_events import (
     UnsupportedKvEventLayoutError,
     VllmKvEventBridge,
 )
+from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
 
 
 def _make_config() -> KVEventsConfig:
@@ -327,5 +328,47 @@ def test_kv_event_bridge_caught_up_subscriber_waits_for_new_batch():
             await stream.aclose()
         finally:
             await bridge.shutdown()
+
+    asyncio.run(run())
+
+
+def test_subscribe_kv_events_sends_initial_metadata_before_first_event():
+    async def run() -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.initial_metadata: list[tuple[()]] = []
+
+            async def send_initial_metadata(self, metadata: tuple[()]) -> None:
+                self.initial_metadata.append(metadata)
+
+        class FakeBridge:
+            enabled = True
+
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def subscribe(self, start_sequence_number: int):
+                assert start_sequence_number == 11
+                self.started.set()
+                await self.release.wait()
+                yield "batch"
+
+        bridge = FakeBridge()
+        servicer = VllmEngineServicer.__new__(VllmEngineServicer)
+        servicer.kv_event_bridge = bridge
+        request = type("Request", (), {"start_sequence_number": 11})()
+        context = FakeContext()
+
+        stream = VllmEngineServicer.SubscribeKvEvents(servicer, request, context)
+        next_batch_task = asyncio.create_task(anext(stream))
+
+        await bridge.started.wait()
+        assert context.initial_metadata == [()]
+        assert not next_batch_task.done()
+
+        bridge.release.set()
+        assert await asyncio.wait_for(next_batch_task, timeout=2) == "batch"
+        await stream.aclose()
 
     asyncio.run(run())
