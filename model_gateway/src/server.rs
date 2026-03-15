@@ -950,7 +950,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Submit startup tokenizer job if tokenizer path is configured
     // This runs before worker initialization to ensure tokenizer is available
-    if let Some(tokenizer_source) = config
+    if config.router_config.disable_tokenizer_autoload {
+        info!("Tokenizer autoload disabled via config; skipping startup tokenizer load");
+    } else if let Some(tokenizer_source) = config
         .router_config
         .tokenizer_path
         .as_ref()

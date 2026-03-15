@@ -433,6 +433,7 @@ struct Router {
     model_path: Option<String>,
     tokenizer_path: Option<String>,
     chat_template: Option<String>,
+    disable_tokenizer_autoload: bool,
     tokenizer_cache_enable_l0: bool,
     tokenizer_cache_l0_max_entries: usize,
     tokenizer_cache_enable_l1: bool,
@@ -680,6 +681,7 @@ impl Router {
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
+            .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .history_backend(history_backend)
             .maybe_api_key(self.api_key.as_ref())
             .maybe_discovery(discovery)
@@ -811,6 +813,7 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         control_plane_auth = None,
         schema_config = None,
+        disable_tokenizer_autoload = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -909,6 +912,7 @@ impl Router {
         otlp_traces_endpoint: String,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         schema_config: Option<String>,
+        disable_tokenizer_autoload: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -995,6 +999,7 @@ impl Router {
             model_path,
             tokenizer_path,
             chat_template,
+            disable_tokenizer_autoload,
             tokenizer_cache_enable_l0,
             tokenizer_cache_l0_max_entries,
             tokenizer_cache_enable_l1,
