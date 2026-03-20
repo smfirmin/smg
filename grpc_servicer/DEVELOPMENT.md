@@ -11,6 +11,43 @@ pip install -e grpc_servicer/
 
 No version concerns locally — editable installs always use the latest source.
 
+## Containerized DX Smoke Test
+
+To simulate a new developer starting from a clean Linux environment, use the
+containerized smoke harness from the repository root:
+
+```bash
+scripts/run_vllm_grpc_servicer_smoke.sh
+```
+
+That flow builds a fresh image, installs `vllm`, `smg-grpc-proto`, and
+`smg-grpc-servicer` from the current checkout, verifies imports, and checks that
+`python -m vllm.entrypoints.grpc_server --help` works.
+
+If you have GPU-backed hardware and a model available, you can also smoke-test
+real gRPC server startup:
+
+```bash
+scripts/run_vllm_grpc_servicer_smoke.sh \
+  --mode serve \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --run-arg=--gpus=all
+```
+
+Notes:
+
+- The wrapper defaults to `--platform linux/amd64` because upstream vLLM wheels
+  are typically published for that target.
+- To start from an upstream vLLM image instead of a plain Python base, pass
+  `--base-image <vllm-image> --use-base-vllm`. That path is useful for testing
+  the developer experience of layering `smg-grpc-servicer` onto an existing
+  vLLM container.
+- If your environment cannot reach Docker Hub, pass `--base-image <image>` to
+  reuse a local/preloaded Python image. Standard proxy variables are forwarded
+  automatically during both `docker build` and `docker run`.
+- The serve mode checks that the gRPC port opens; it is meant as a startup
+  smoke test, not a full inference benchmark.
+
 ## CI — vLLM
 
 PR tests install both `smg-grpc-proto` and `smg-grpc-servicer` from source (not PyPI),
