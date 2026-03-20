@@ -28,6 +28,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /workspace
+COPY crates/grpc_client/proto /workspace/crates/grpc_client/proto
 COPY crates/grpc_client/python /workspace/crates/grpc_client/python
 COPY grpc_servicer /workspace/grpc_servicer
 

@@ -76,9 +76,19 @@ for name in modules:
     print(f"import ok: {name}")
 PY
 
+echo "==> Installing test dependencies"
+install_pkg pytest
+
 echo "==> Verifying vLLM gRPC entrypoint is present"
-python -m vllm.entrypoints.grpc_server --help >/tmp/vllm-grpc-help.txt
-echo "entrypoint ok: vllm.entrypoints.grpc_server"
+python - <<'PY'
+import importlib.util
+spec = importlib.util.find_spec("vllm.entrypoints.grpc_server")
+assert spec is not None, "vllm.entrypoints.grpc_server not found in installed vllm"
+print(f"entrypoint ok: vllm.entrypoints.grpc_server ({spec.origin})")
+PY
+
+echo "==> Running KV cache gRPC tests"
+python -m pytest grpc_servicer/tests/ -v --tb=short -m "not gpu"
 
 if [[ "${MODE}" == "install" ]]; then
     echo "install smoke test completed successfully"
