@@ -566,6 +566,22 @@ async fn update_worker(
     }
 }
 
+async fn replace_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+    Json(config): Json<WorkerSpec>,
+) -> Response {
+    match state
+        .context
+        .worker_service
+        .replace_worker(&worker_id_raw, config)
+        .await
+    {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
 // ============================================================================
 // Tokenize / Detokenize Handlers
 // ============================================================================
@@ -771,7 +787,10 @@ pub fn build_app(
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",
-            get(get_worker).put(update_worker).delete(delete_worker),
+            get(get_worker)
+                .put(replace_worker)
+                .patch(update_worker)
+                .delete(delete_worker),
         );
 
     // Apply authentication middleware to control plane routes
@@ -1197,14 +1216,39 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
-    let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
+    let inflight_tracker = app_context.inflight_tracker.clone();
+    let drain_timeout = Duration::from_secs(config.shutdown_grace_period_secs);
     #[expect(
         clippy::disallowed_methods,
         reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
     )]
     spawn(async move {
         shutdown_signal().await;
-        handle_clone.graceful_shutdown(Some(grace_period));
+
+        // Phase 1: Gate — stop accepting new connections, mark as draining
+        info!(
+            in_flight = inflight_tracker.len(),
+            "Beginning graceful shutdown: gating new connections"
+        );
+        inflight_tracker.begin_drain();
+        handle_clone.graceful_shutdown(Some(drain_timeout));
+
+        // Phase 2: Drain — wait for in-flight requests to complete
+        // Re-check after gating to catch requests that arrived between the
+        // snapshot and graceful_shutdown stopping the accept loop.
+        if !inflight_tracker.is_empty() {
+            let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
+            if drained {
+                info!("All in-flight requests drained");
+            } else {
+                warn!(
+                    remaining = inflight_tracker.len(),
+                    timeout_secs = drain_timeout.as_secs(),
+                    "Drain timed out, forcing shutdown with requests still in-flight"
+                );
+            }
+        }
+        // Phase 3: Teardown proceeds after axum server stops (in the main task)
     });
 
     let server_result = if let (Some(cert), Some(key)) = (
