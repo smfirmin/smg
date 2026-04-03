@@ -9,6 +9,7 @@ import asyncio
 import itertools
 import time
 from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING
 
 import grpc
 import torch
@@ -17,20 +18,16 @@ from smg_grpc_servicer.vllm.kv_events import (
     UnsupportedKvEventLayoutError,
     VllmKvEventBridge,
 )
-from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
 from vllm.engine.protocol import EngineClient
-from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
-from vllm.inputs.engine import mm_input, tokens_input
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
-from vllm.multimodal.inputs import (
-    MultiModalFieldConfig,
-    MultiModalKwargsItems,
-    PlaceholderRange,
-)
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
+
+if TYPE_CHECKING:
+    from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
+    from vllm.multimodal.inputs import MultiModalInputs as VllmMultiModalInputs
 
 logger = init_logger(__name__)
 
@@ -48,6 +45,16 @@ def _tensor_from_proto(td: vllm_engine_pb2.TensorData) -> torch.Tensor:
     if torch_dtype is None:
         raise ValueError(f"Unsupported proto tensor dtype: {td.dtype!r}")
     return torch.frombuffer(bytearray(td.data), dtype=torch_dtype).reshape(*td.shape)
+
+
+def _make_tokens_input(*, prompt_token_ids: list[int], prompt: str | None) -> object:
+    """Build a tokenized vLLM prompt across input module layouts."""
+    try:
+        from vllm.inputs.engine import tokens_input
+    except ImportError:
+        from vllm.inputs import tokens_input
+
+    return tokens_input(prompt_token_ids=prompt_token_ids, prompt=prompt)
 
 
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
@@ -218,7 +225,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             if not request.HasField("tokenized"):
                 raise ValueError("EmbedRequest requires tokenized input")
 
-            prompt = tokens_input(
+            prompt = _make_tokens_input(
                 prompt_token_ids=list(request.tokenized.input_ids),
                 prompt=request.tokenized.original_text or None,
             )
@@ -408,14 +415,22 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self,
         tokenized: vllm_engine_pb2.TokenizedInput,
         mm_proto: vllm_engine_pb2.MultimodalInputs,
-    ) -> VllmMultiModalInput:
-        """Build vLLM MultiModalInput from preprocessed proto data.
+    ) -> object:
+        """Build vLLM multimodal prompt inputs from preprocessed proto data.
 
         Bypasses HF processor entirely — pixel values and model-specific
         tensors were already computed by the Rust router.  Field layouts
         (batched / flat / shared) are also determined by the router via
         ``batched_keys`` and ``flat_keys`` proto fields.
         """
+        from transformers import BatchFeature
+        from vllm.multimodal.inputs import (
+            MultiModalFieldConfig,
+            MultiModalInputs as VllmMultiModalInputs,
+            MultiModalKwargsItems,
+            PlaceholderRange,
+        )
+
         prompt_token_ids = list(tokenized.input_ids)
         num_images = len(mm_proto.mm_placeholders)
 
@@ -490,6 +505,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     PlaceholderRange(offset=p.offset, length=p.length, is_embed=is_embed)
                 )
             mm_placeholders["image"] = placeholders
+
+        try:
+            from vllm.inputs.engine import mm_input
+        except ImportError:
+            return VllmMultiModalInputs(
+                type="multimodal",
+                prompt_token_ids=prompt_token_ids,
+                mm_kwargs=mm_kwargs,
+                mm_hashes=mm_hashes,
+                mm_placeholders=mm_placeholders,
+                prompt=tokenized.original_text or None,
+            )
 
         return mm_input(
             prompt_token_ids=prompt_token_ids,

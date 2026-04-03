@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-pytest.importorskip("torch")
+pytest.importorskip("vllm")
 
 from vllm.config.kv_events import KVEventsConfig
 from vllm.distributed.kv_events import (
