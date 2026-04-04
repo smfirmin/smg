@@ -36,6 +36,9 @@ const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 /// Maximum reconnection delay (caps exponential backoff).
 const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
 
+/// Marker substring used by grpc_servicer when a replay cursor falls out of the window.
+const EXPIRED_REPLAY_CURSOR_MSG: &str = "expired KV event replay cursor";
+
 /// Manages per-worker KV cache event subscriptions.
 ///
 /// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
@@ -267,6 +270,11 @@ impl KvEventMonitor {
         }
     }
 
+    fn is_expired_replay_cursor(status: &tonic::Status) -> bool {
+        status.code() == tonic::Code::FailedPrecondition
+            && status.message().contains(EXPIRED_REPLAY_CURSOR_MSG)
+    }
+
     // -----------------------------------------------------------------------
     // Subscription loop
     // -----------------------------------------------------------------------
@@ -387,17 +395,36 @@ impl KvEventMonitor {
                     stream
                 }
                 Err(e) => {
+                    if Self::is_expired_replay_cursor(&e) {
+                        warn!(
+                            worker_url = %worker_url,
+                            error = %e,
+                            last_seq = last_seq,
+                            "KV event replay cursor expired; clearing worker KV state and reconnecting from seq 0"
+                        );
+                        indexer.remove_worker(worker_id, std::mem::take(&mut worker_blocks));
+                        last_seq = 0;
+                        block_size_learned = false;
+                        continue;
+                    }
+
                     // If the backend doesn't support KV event streaming for this
                     // worker, stop retrying — this RPC will never succeed.
-                    if matches!(
-                        e.code(),
-                        tonic::Code::Unimplemented | tonic::Code::FailedPrecondition
-                    ) {
+                    if e.code() == tonic::Code::Unimplemented {
                         warn!(
                             worker_url = %worker_url,
                             code = ?e.code(),
-                            "Backend does not implement SubscribeKvEvents, \
-                             disabling KV event subscription for this worker"
+                            "Backend does not implement SubscribeKvEvents, disabling KV event subscription for this worker"
+                        );
+                        indexer.remove_worker(worker_id, worker_blocks);
+                        return;
+                    }
+                    if e.code() == tonic::Code::FailedPrecondition {
+                        warn!(
+                            worker_url = %worker_url,
+                            code = ?e.code(),
+                            error = %e,
+                            "Backend does not support KV event streaming, disabling KV event subscription for this worker"
                         );
                         indexer.remove_worker(worker_id, worker_blocks);
                         return;
@@ -454,15 +481,36 @@ impl KvEventMonitor {
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
                 StreamResult::Error(status) => {
-                    if matches!(
-                        status.code(),
-                        tonic::Code::Unimplemented | tonic::Code::FailedPrecondition
-                    ) {
+                    if Self::is_expired_replay_cursor(&status) {
+                        warn!(
+                            worker_url = %worker_url,
+                            error = %status,
+                            last_seq = last_seq,
+                            "KV event replay cursor expired; clearing worker KV state and reconnecting from seq 0"
+                        );
+                        indexer.remove_worker(worker_id, std::mem::take(&mut worker_blocks));
+                        last_seq = 0;
+                        block_size_learned = false;
+                        continue;
+                    }
+
+                    if status.code() == tonic::Code::Unimplemented {
                         warn!(
                             worker_url = %worker_url,
                             code = ?status.code(),
                             error = %status,
-                            "Backend disabled KV event streaming for this worker"
+                            "Backend does not implement SubscribeKvEvents, disabling KV event subscription for this worker"
+                        );
+                        indexer.remove_worker(worker_id, worker_blocks);
+                        return;
+                    }
+
+                    if status.code() == tonic::Code::FailedPrecondition {
+                        warn!(
+                            worker_url = %worker_url,
+                            code = ?status.code(),
+                            error = %status,
+                            "Backend does not support KV event streaming, disabling KV event subscription for this worker"
                         );
                         indexer.remove_worker(worker_id, worker_blocks);
                         return;
@@ -802,6 +850,22 @@ mod tests {
 
         assert!(matches!(result, BatchResult::SkipStale));
         assert_eq!(last_seq, 5);
+    }
+
+    #[test]
+    fn test_is_expired_replay_cursor_matches_expected_failed_precondition() {
+        let status = tonic::Status::failed_precondition(
+            "expired KV event replay cursor: requested sequence 10, oldest available sequence 20",
+        );
+        assert!(KvEventMonitor::is_expired_replay_cursor(&status));
+    }
+
+    #[test]
+    fn test_is_expired_replay_cursor_ignores_other_failed_preconditions() {
+        let status = tonic::Status::failed_precondition(
+            "Unsupported BlockStored layout from vLLM",
+        );
+        assert!(!KvEventMonitor::is_expired_replay_cursor(&status));
     }
 
     // -----------------------------------------------------------------------

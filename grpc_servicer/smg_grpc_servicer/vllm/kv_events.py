@@ -30,6 +30,10 @@ class UnsupportedKvEventLayoutError(RuntimeError):
     """Raised when a vLLM KV event cannot be translated losslessly."""
 
 
+class ExpiredReplayCursorError(RuntimeError):
+    """Raised when a requested replay cursor has fallen out of the replay window."""
+
+
 def _connect_endpoint(endpoint: str | None, rank: int) -> str | None:
     """Convert a publisher bind endpoint into a subscriber connect endpoint."""
     offset = ZmqEventPublisher.offset_endpoint_port(endpoint, rank)
@@ -155,12 +159,10 @@ class KvEventReplayBuffer:
         producer_next = self._next_sequence_number
 
         if next_seq and next_seq < oldest:
-            logger.warning(
-                "Requested KV event replay from expired sequence %s; oldest=%s",
-                next_seq,
-                oldest,
+            raise ExpiredReplayCursorError(
+                "expired KV event replay cursor: "
+                f"requested sequence {next_seq}, oldest available sequence {oldest}"
             )
-            return oldest
 
         if next_seq and next_seq > producer_next:
             logger.warning(
@@ -387,7 +389,7 @@ class VllmKvEventBridge:
             seq_bytes, payload = frames
             rank_seq = int.from_bytes(seq_bytes, "big", signed=True)
             if rank_seq < 0:
-                continue
+                break
             await self._ingest_rank_batch(rank, rank_seq, payload)
 
     async def _ingest_rank_batch(self, rank: int, rank_seq: int, payload: bytes) -> None:

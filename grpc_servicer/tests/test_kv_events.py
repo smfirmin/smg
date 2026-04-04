@@ -16,6 +16,7 @@ from vllm.distributed.kv_events import (
 from vllm.utils.network_utils import get_open_ports_list, get_tcp_uri
 
 from smg_grpc_servicer.vllm.kv_events import (
+    ExpiredReplayCursorError,
     KvEventReplayBuffer,
     UnsupportedKvEventLayoutError,
     VllmKvEventBridge,
@@ -334,6 +335,72 @@ def test_kv_event_bridge_caught_up_subscriber_waits_for_new_batch():
     asyncio.run(run())
 
 
+def test_kv_event_bridge_replay_rank_drains_multiple_batches_from_single_request():
+    async def run() -> None:
+        import msgspec.msgpack
+
+        class FakeReplaySocket:
+            def __init__(self, frames) -> None:
+                self.frames = list(frames)
+                self.sent: list[int] = []
+                self.poll_calls = 0
+
+            async def send(self, payload: bytes) -> None:
+                self.sent.append(int.from_bytes(payload, "big"))
+
+            async def poll(self, timeout: int) -> bool:
+                self.poll_calls += 1
+                return bool(self.frames)
+
+            async def recv_multipart(self):
+                return self.frames.pop(0)
+
+        config = _make_config()
+        bridge = VllmKvEventBridge(config, data_parallel_size=1)
+
+        stored_payload = msgspec.msgpack.encode(
+            KVEventBatch(
+                ts=time.time(),
+                events=[
+                    BlockStored(
+                        block_hashes=[801],
+                        parent_block_hash=None,
+                        token_ids=[1, 2, 3, 4],
+                        block_size=4,
+                        lora_id=None,
+                        medium="GPU",
+                        lora_name=None,
+                    )
+                ],
+                data_parallel_rank=0,
+            )
+        )
+        removed_payload = msgspec.msgpack.encode(
+            KVEventBatch(
+                ts=time.time(),
+                events=[BlockRemoved(block_hashes=[801], medium="GPU")],
+                data_parallel_rank=0,
+            )
+        )
+        replay = FakeReplaySocket(
+            [
+                [(1).to_bytes(8, "big", signed=True), stored_payload],
+                [(2).to_bytes(8, "big", signed=True), removed_payload],
+                [(-1).to_bytes(8, "big", signed=True), b"done"],
+            ]
+        )
+
+        await bridge._replay_rank(0, replay)
+
+        buffered = list(bridge._buffer)
+        assert replay.sent == [0]
+        assert replay.poll_calls == 3
+        assert [batch.sequence_number for batch in buffered] == [1, 2]
+        assert buffered[1].events[0].HasField("removed")
+
+    asyncio.run(run())
+
+
 def test_subscribe_kv_events_sends_initial_metadata_before_first_event():
     async def run() -> None:
         class FakeContext:
@@ -414,6 +481,7 @@ def test_kv_event_replay_buffer_normalizes_replay_window():
         batch=common_pb2.KvEventBatch(sequence_number=3),
     )
 
-    assert [batch.sequence_number for batch in replay.replay_from(1)] == [2, 3]
+    with pytest.raises(ExpiredReplayCursorError, match="expired KV event replay cursor"):
+        replay.replay_from(1)
     assert [batch.sequence_number for batch in replay.replay_from(99)] == [2, 3]
     assert replay.last_rank_sequence[0] == 3

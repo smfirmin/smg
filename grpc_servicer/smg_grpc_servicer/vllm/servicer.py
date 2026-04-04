@@ -15,6 +15,7 @@ import grpc
 import torch
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.kv_events import (
+    ExpiredReplayCursorError,
     UnsupportedKvEventLayoutError,
     VllmKvEventBridge,
 )
@@ -399,6 +400,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 yield batch
         except asyncio.CancelledError:
             raise
+        except ExpiredReplayCursorError as e:
+            logger.warning("Expired KV event replay cursor in SubscribeKvEvents: %s", e)
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
         except UnsupportedKvEventLayoutError as e:
             logger.exception("Unsupported KV event layout in SubscribeKvEvents")
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
