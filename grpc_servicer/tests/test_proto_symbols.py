@@ -85,6 +85,7 @@ def test_kv_event_batch_serialization_round_trip():
     decoded.ParseFromString(wire)
 
     assert decoded.sequence_number == 42
+    assert decoded.timestamp == 1_234_567_890.5
     assert decoded.dp_rank == 1
     assert len(decoded.events) == 3
 

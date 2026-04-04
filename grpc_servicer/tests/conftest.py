@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
-from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -12,11 +11,13 @@ _ROOT = Path(__file__).resolve().parents[2]
 _PROTO_SRC = _ROOT / "crates" / "grpc_client" / "python"
 _SERVICER_SRC = _ROOT / "grpc_servicer"
 
-if find_spec("smg_grpc_proto") is None and str(_PROTO_SRC) not in sys.path:
-    sys.path.insert(0, str(_PROTO_SRC))
+if str(_PROTO_SRC) in sys.path:
+    sys.path.remove(str(_PROTO_SRC))
+sys.path.insert(0, str(_PROTO_SRC))
 
-if find_spec("smg_grpc_servicer") is None and str(_SERVICER_SRC) not in sys.path:
-    sys.path.insert(0, str(_SERVICER_SRC))
+if str(_SERVICER_SRC) in sys.path:
+    sys.path.remove(str(_SERVICER_SRC))
+sys.path.insert(0, str(_SERVICER_SRC))
 
 _PROTO_SYMBOL_SKIP_REASON: str | None = None
 
@@ -55,7 +56,5 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     if _PROTO_SYMBOL_SKIP_REASON is None:
         return
 
-    skip = pytest.mark.skip(reason=_PROTO_SYMBOL_SKIP_REASON)
-    for item in items:
-        if "test_proto_symbols.py" in item.nodeid:
-            item.add_marker(skip)
+    if any("test_proto_symbols.py" in item.nodeid for item in items):
+        pytest.fail(_PROTO_SYMBOL_SKIP_REASON, pytrace=False)
