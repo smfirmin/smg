@@ -5,27 +5,30 @@ vLLM gRPC Servicer
 Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 """
 
+import asyncio
 import itertools
 import time
 from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING
 
 import grpc
 import torch
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
-from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
 from vllm.engine.protocol import EngineClient
-from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
-from vllm.inputs.engine import mm_input, tokens_input
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
-from vllm.multimodal.inputs import (
-    MultiModalFieldConfig,
-    MultiModalKwargsItems,
-    PlaceholderRange,
-)
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
+
+from smg_grpc_servicer.vllm.kv_events import (
+    ExpiredReplayCursorError,
+    UnsupportedKvEventLayoutError,
+    VllmKvEventBridge,
+)
+
+if TYPE_CHECKING:
+    pass
 
 logger = init_logger(__name__)
 
@@ -45,17 +48,28 @@ def _tensor_from_proto(td: vllm_engine_pb2.TensorData) -> torch.Tensor:
     return torch.frombuffer(bytearray(td.data), dtype=torch_dtype).reshape(*td.shape)
 
 
+def _make_tokens_input(*, prompt_token_ids: list[int], prompt: str | None) -> object:
+    """Build a tokenized vLLM prompt across input module layouts."""
+    try:
+        from vllm.inputs.engine import tokens_input
+    except ImportError:
+        from vllm.inputs import tokens_input
+
+    return tokens_input(prompt_token_ids=prompt_token_ids, prompt=prompt)
+
+
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     """
     gRPC servicer implementing the VllmEngine service.
 
-    Handles 6 RPCs:
+    Handles 7 RPCs:
     - Generate: Streaming text generation
     - Embed: Embeddings
     - HealthCheck: Health probe
     - Abort: Cancel requests out-of-band
     - GetModelInfo: Model metadata
     - GetServerInfo: Server state
+    - SubscribeKvEvents: KV cache event streaming
     """
 
     def __init__(self, async_llm: EngineClient, start_time: float):
@@ -68,6 +82,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """
         self.engine = async_llm
         self.start_time = start_time
+        self.kv_event_bridge = VllmKvEventBridge(
+            async_llm.vllm_config.kv_events_config,
+            async_llm.vllm_config.parallel_config.data_parallel_size,
+        )
+        self.kv_event_bridge.start()
         logger.info("VllmEngineServicer initialized")
 
     async def Generate(
@@ -207,7 +226,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             if not request.HasField("tokenized"):
                 raise ValueError("EmbedRequest requires tokenized input")
 
-            prompt = tokens_input(
+            prompt = _make_tokens_input(
                 prompt_token_ids=list(request.tokenized.input_ids),
                 prompt=request.tokenized.original_text or None,
             )
@@ -358,20 +377,66 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_role=kv_role,
         )
 
+    async def SubscribeKvEvents(
+        self,
+        request,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncGenerator[object, None]:
+        """
+        Stream KV cache events to the caller.
+        """
+        if not self.kv_event_bridge.enabled:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV cache events are not enabled for this vLLM server",
+            )
+
+        try:
+            # grpc.aio defers headers until the first yield unless they are
+            # sent explicitly. Send them now so tonic callers don't block on
+            # subscribe_kv_events(...).await when the stream is idle.
+            await context.send_initial_metadata(())
+            async for batch in self.kv_event_bridge.subscribe(request.start_sequence_number):
+                yield batch
+        except asyncio.CancelledError:
+            raise
+        except ExpiredReplayCursorError as e:
+            logger.warning("Expired KV event replay cursor in SubscribeKvEvents: %s", e)
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
+        except UnsupportedKvEventLayoutError as e:
+            logger.exception("Unsupported KV event layout in SubscribeKvEvents")
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
+        except Exception as e:
+            logger.exception("Error in SubscribeKvEvents")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+    async def shutdown(self) -> None:
+        await self.kv_event_bridge.shutdown()
+
     # ========== Helper methods ==========
 
     def _build_preprocessed_mm_inputs(
         self,
         tokenized: vllm_engine_pb2.TokenizedInput,
         mm_proto: vllm_engine_pb2.MultimodalInputs,
-    ) -> VllmMultiModalInput:
-        """Build vLLM MultiModalInput from preprocessed proto data.
+    ) -> object:
+        """Build vLLM multimodal prompt inputs from preprocessed proto data.
 
         Bypasses HF processor entirely — pixel values and model-specific
         tensors were already computed by the Rust router.  Field layouts
         (batched / flat / shared) are also determined by the router via
         ``batched_keys`` and ``flat_keys`` proto fields.
         """
+        from transformers import BatchFeature
+        from vllm.multimodal.inputs import (
+            MultiModalFieldConfig,
+            MultiModalKwargsItems,
+            PlaceholderRange,
+        )
+        from vllm.multimodal.inputs import (
+            MultiModalInputs as VllmMultiModalInputs,
+        )
+
         prompt_token_ids = list(tokenized.input_ids)
         num_images = len(mm_proto.mm_placeholders)
 
@@ -446,6 +511,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     PlaceholderRange(offset=p.offset, length=p.length, is_embed=is_embed)
                 )
             mm_placeholders["image"] = placeholders
+
+        try:
+            from vllm.inputs.engine import mm_input
+        except ImportError:
+            return VllmMultiModalInputs(
+                type="multimodal",
+                prompt_token_ids=prompt_token_ids,
+                mm_kwargs=mm_kwargs,
+                mm_hashes=mm_hashes,
+                mm_placeholders=mm_placeholders,
+                prompt=tokenized.original_text or None,
+            )
 
         return mm_input(
             prompt_token_ids=prompt_token_ids,
