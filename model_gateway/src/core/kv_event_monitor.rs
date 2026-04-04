@@ -36,6 +36,9 @@ const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 /// Maximum reconnection delay (caps exponential backoff).
 const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
 
+/// Marker substring used by grpc_servicer when a replay cursor falls out of the window.
+const EXPIRED_REPLAY_CURSOR_MSG: &str = "expired KV event replay cursor";
+
 /// Manages per-worker KV cache event subscriptions.
 ///
 /// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
@@ -69,9 +72,19 @@ enum StreamResult {
     /// Stream closed normally (server-side).
     Ended,
     /// Stream produced an error.
-    Error(String),
+    Error(tonic::Status),
     /// Detected a gap in sequence numbers.
     GapDetected { expected: u64, received: u64 },
+    /// Detected that the backend restarted and sequence numbers reset.
+    RestartDetected { previous: u64, received: u64 },
+}
+
+/// Result of handling a single batch within a stream connection.
+enum BatchResult {
+    Applied,
+    SkipStale,
+    GapDetected { expected: u64, received: u64 },
+    RestartDetected { previous: u64, received: u64 },
 }
 
 impl KvEventMonitor {
@@ -257,6 +270,11 @@ impl KvEventMonitor {
         }
     }
 
+    fn is_expired_replay_cursor(status: &tonic::Status) -> bool {
+        status.code() == tonic::Code::FailedPrecondition
+            && status.message().contains(EXPIRED_REPLAY_CURSOR_MSG)
+    }
+
     // -----------------------------------------------------------------------
     // Subscription loop
     // -----------------------------------------------------------------------
@@ -377,13 +395,36 @@ impl KvEventMonitor {
                     stream
                 }
                 Err(e) => {
-                    // If the backend doesn't implement SubscribeKvEvents (e.g. vLLM),
-                    // stop retrying — this RPC will never succeed.
+                    if Self::is_expired_replay_cursor(&e) {
+                        warn!(
+                            worker_url = %worker_url,
+                            error = %e,
+                            last_seq = last_seq,
+                            "KV event replay cursor expired; clearing worker KV state and reconnecting from seq 0"
+                        );
+                        indexer.remove_worker(worker_id, std::mem::take(&mut worker_blocks));
+                        last_seq = 0;
+                        block_size_learned = false;
+                        continue;
+                    }
+
+                    // If the backend doesn't support KV event streaming for this
+                    // worker, stop retrying — this RPC will never succeed.
                     if e.code() == tonic::Code::Unimplemented {
                         warn!(
                             worker_url = %worker_url,
-                            "Backend does not implement SubscribeKvEvents, \
-                             disabling KV event subscription for this worker"
+                            code = ?e.code(),
+                            "Backend does not implement SubscribeKvEvents, disabling KV event subscription for this worker"
+                        );
+                        indexer.remove_worker(worker_id, worker_blocks);
+                        return;
+                    }
+                    if e.code() == tonic::Code::FailedPrecondition {
+                        warn!(
+                            worker_url = %worker_url,
+                            code = ?e.code(),
+                            error = %e,
+                            "Backend does not support KV event streaming, disabling KV event subscription for this worker"
                         );
                         indexer.remove_worker(worker_id, worker_blocks);
                         return;
@@ -411,7 +452,7 @@ impl KvEventMonitor {
             };
             let stream_result = tokio::select! {
                 result = Self::process_stream(
-                    stream, &worker_url, worker_id, &indexer,
+                    stream, worker_id, &indexer,
                     &mut worker_blocks, &mut last_seq, on_batch,
                 ) => result,
                 _ = &mut shutdown_rx => {
@@ -439,10 +480,45 @@ impl KvEventMonitor {
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
-                StreamResult::Error(e) => {
+                StreamResult::Error(status) => {
+                    if Self::is_expired_replay_cursor(&status) {
+                        warn!(
+                            worker_url = %worker_url,
+                            error = %status,
+                            last_seq = last_seq,
+                            "KV event replay cursor expired; clearing worker KV state and reconnecting from seq 0"
+                        );
+                        indexer.remove_worker(worker_id, std::mem::take(&mut worker_blocks));
+                        last_seq = 0;
+                        block_size_learned = false;
+                        continue;
+                    }
+
+                    if status.code() == tonic::Code::Unimplemented {
+                        warn!(
+                            worker_url = %worker_url,
+                            code = ?status.code(),
+                            error = %status,
+                            "Backend does not implement SubscribeKvEvents, disabling KV event subscription for this worker"
+                        );
+                        indexer.remove_worker(worker_id, worker_blocks);
+                        return;
+                    }
+
+                    if status.code() == tonic::Code::FailedPrecondition {
+                        warn!(
+                            worker_url = %worker_url,
+                            code = ?status.code(),
+                            error = %status,
+                            "Backend does not support KV event streaming, disabling KV event subscription for this worker"
+                        );
+                        indexer.remove_worker(worker_id, worker_blocks);
+                        return;
+                    }
+
                     warn!(
                         worker_url = %worker_url,
-                        error = %e,
+                        error = %status,
                         last_seq = last_seq,
                         delay_ms = reconnect_delay_ms,
                         "KV event stream error, reconnecting"
@@ -465,6 +541,18 @@ impl KvEventMonitor {
                     );
                     // No backoff — gap replay is a normal recovery path.
                 }
+                StreamResult::RestartDetected { previous, received } => {
+                    warn!(
+                        worker_url = %worker_url,
+                        previous = previous,
+                        received = received,
+                        "Sequence regression detected, assuming backend restart; \
+                         clearing worker KV state and reconnecting from seq 0"
+                    );
+                    indexer.remove_worker(worker_id, std::mem::take(&mut worker_blocks));
+                    last_seq = 0;
+                    block_size_learned = false;
+                }
             }
         }
     }
@@ -476,7 +564,6 @@ impl KvEventMonitor {
     /// Process batches from a single stream connection.
     async fn process_stream(
         mut stream: tonic::Streaming<KvEventBatch>,
-        worker_url: &str,
         worker_id: u32,
         indexer: &PositionalIndexer,
         worker_blocks: &mut WorkerBlockMap,
@@ -485,41 +572,80 @@ impl KvEventMonitor {
     ) -> StreamResult {
         use tokio_stream::StreamExt;
 
+        let mut awaiting_first_fresh_batch = true;
         while let Some(result) = stream.next().await {
             let batch = match result {
                 Ok(batch) => batch,
-                Err(e) => return StreamResult::Error(e.to_string()),
+                Err(e) => return StreamResult::Error(e),
             };
 
-            // Skip stale/duplicate batches (can occur after reconnect replay).
-            if *last_seq > 0 && batch.sequence_number <= *last_seq {
-                debug!(
-                    worker_url = %worker_url,
-                    last_seq = *last_seq,
-                    received = batch.sequence_number,
-                    "Skipping stale KV event batch"
-                );
-                continue;
+            match Self::handle_batch(
+                &batch,
+                worker_id,
+                indexer,
+                worker_blocks,
+                last_seq,
+                awaiting_first_fresh_batch,
+                &mut on_batch,
+            ) {
+                BatchResult::Applied => {
+                    awaiting_first_fresh_batch = false;
+                }
+                BatchResult::SkipStale => continue,
+                BatchResult::GapDetected { expected, received } => {
+                    return StreamResult::GapDetected { expected, received };
+                }
+                BatchResult::RestartDetected { previous, received } => {
+                    return StreamResult::RestartDetected { previous, received };
+                }
             }
-
-            // Gap detection.
-            if *last_seq > 0 && batch.sequence_number > *last_seq + 1 {
-                return StreamResult::GapDetected {
-                    expected: *last_seq + 1,
-                    received: batch.sequence_number,
-                };
-            }
-
-            on_batch(&batch);
-
-            for event in &batch.events {
-                Self::apply_event(event, worker_id, indexer, worker_blocks);
-            }
-
-            *last_seq = batch.sequence_number;
         }
 
         StreamResult::Ended
+    }
+
+    fn handle_batch(
+        batch: &KvEventBatch,
+        worker_id: u32,
+        indexer: &PositionalIndexer,
+        worker_blocks: &mut WorkerBlockMap,
+        last_seq: &mut u64,
+        awaiting_first_fresh_batch: bool,
+        on_batch: &mut impl FnMut(&KvEventBatch),
+    ) -> BatchResult {
+        if *last_seq > 0 && awaiting_first_fresh_batch && batch.sequence_number < *last_seq {
+            return BatchResult::RestartDetected {
+                previous: *last_seq,
+                received: batch.sequence_number,
+            };
+        }
+
+        // Skip stale/duplicate batches (can occur after reconnect replay).
+        if *last_seq > 0 && batch.sequence_number <= *last_seq {
+            debug!(
+                last_seq = *last_seq,
+                received = batch.sequence_number,
+                "Skipping stale KV event batch"
+            );
+            return BatchResult::SkipStale;
+        }
+
+        // Gap detection.
+        if *last_seq > 0 && batch.sequence_number > *last_seq + 1 {
+            return BatchResult::GapDetected {
+                expected: *last_seq + 1,
+                received: batch.sequence_number,
+            };
+        }
+
+        on_batch(batch);
+
+        for event in &batch.events {
+            Self::apply_event(event, worker_id, indexer, worker_blocks);
+        }
+
+        *last_seq = batch.sequence_number;
+        BatchResult::Applied
     }
 
     /// Apply a single KV cache event to the indexer.
@@ -665,6 +791,79 @@ mod tests {
         let stored = convert_kv_block(&block);
         assert_eq!(stored.seq_hash, SequenceHash::from(100i64));
         assert_eq!(stored.content_hash, compute_content_hash(&[]));
+    }
+
+    #[test]
+    fn test_handle_batch_detects_restart_on_regressed_first_batch() {
+        let indexer = PositionalIndexer::new(64);
+        let worker_id = indexer.intern_worker("http://w1:8000");
+        let mut worker_blocks = WorkerBlockMap::default();
+        let mut last_seq = 5;
+        let batch = KvEventBatch {
+            sequence_number: 1,
+            timestamp: 0.0,
+            events: vec![],
+            dp_rank: None,
+        };
+
+        let result = KvEventMonitor::handle_batch(
+            &batch,
+            worker_id,
+            &indexer,
+            &mut worker_blocks,
+            &mut last_seq,
+            true,
+            &mut |_| {},
+        );
+
+        match result {
+            BatchResult::RestartDetected { previous, received } => {
+                assert_eq!(previous, 5);
+                assert_eq!(received, 1);
+            }
+            _ => panic!("expected restart detection"),
+        }
+    }
+
+    #[test]
+    fn test_handle_batch_skips_replayed_last_batch() {
+        let indexer = PositionalIndexer::new(64);
+        let worker_id = indexer.intern_worker("http://w1:8000");
+        let mut worker_blocks = WorkerBlockMap::default();
+        let mut last_seq = 5;
+        let batch = KvEventBatch {
+            sequence_number: 5,
+            timestamp: 0.0,
+            events: vec![],
+            dp_rank: None,
+        };
+
+        let result = KvEventMonitor::handle_batch(
+            &batch,
+            worker_id,
+            &indexer,
+            &mut worker_blocks,
+            &mut last_seq,
+            true,
+            &mut |_| {},
+        );
+
+        assert!(matches!(result, BatchResult::SkipStale));
+        assert_eq!(last_seq, 5);
+    }
+
+    #[test]
+    fn test_is_expired_replay_cursor_matches_expected_failed_precondition() {
+        let status = tonic::Status::failed_precondition(
+            "expired KV event replay cursor: requested sequence 10, oldest available sequence 20",
+        );
+        assert!(KvEventMonitor::is_expired_replay_cursor(&status));
+    }
+
+    #[test]
+    fn test_is_expired_replay_cursor_ignores_other_failed_preconditions() {
+        let status = tonic::Status::failed_precondition("Unsupported BlockStored layout from vLLM");
+        assert!(!KvEventMonitor::is_expired_replay_cursor(&status));
     }
 
     // -----------------------------------------------------------------------
