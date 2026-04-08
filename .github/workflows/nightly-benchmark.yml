@@ -350,6 +350,7 @@ jobs:
           - { id: meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8, slug: meta-llama-Llama-4-Maverick-17B-128E-Instruct-FP8, test_class: TestNightlyLlama4MaverickSingle }
           # Pausing MiniMax M2 nightly benchmark
           # - { id: minimaxai/minimax-m2, slug: minimaxai-minimax-m2, test_class: TestNightlyMinimaxM2Single }
+          - { id: mistralai/Devstral-2-123B-Instruct-2512, slug: mistralai-Devstral-2-123B-Instruct-2512, test_class: TestNightlyDevstral2Single }
         variant:
           - { id: sglang, runtime: sglang, grpc_only: "false", setup_vllm: false, setup_trtllm: false, extra_deps: "genai-bench" }
           - { id: vllm,   runtime: vllm,   grpc_only: "false", setup_vllm: true, setup_trtllm: false, extra_deps: "genai-bench" }

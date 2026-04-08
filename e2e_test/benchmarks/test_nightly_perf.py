@@ -103,6 +103,13 @@ _NIGHTLY_MODELS: list[tuple[str, str, int, list[str], dict]] = [
     ("openai/gpt-oss-20b", "GptOss20b", 1, ["http", "grpc"], {}),
     ("minimaxai/minimax-m2", "MinimaxM2", 1, ["http", "grpc"], {}),
     (
+        "mistralai/Devstral-2-123B-Instruct-2512",
+        "Devstral2",
+        1,
+        ["http", "grpc"],
+        {},
+    ),
+    (
         "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
         "Llama4Maverick",
         1,
