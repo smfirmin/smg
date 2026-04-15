@@ -10,7 +10,7 @@ use std::{
 
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, StringOrArray},
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
@@ -442,16 +442,9 @@ impl SglangSchedulerClient {
 
         let max_new_tokens = request.max_completion_tokens;
 
-        // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
-        let skip_special_tokens = if request.tools.is_some() {
-            match &request.tool_choice {
-                Some(ToolChoice::Value(ToolChoiceValue::None)) => request.skip_special_tokens,
-                Some(_) => false, // tool_choice is not "none"
-                None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
-            }
-        } else {
-            request.skip_special_tokens
-        };
+        // Hardcode to true: gRPC backends return raw token IDs, not decoded text.
+        // Detokenization happens on the SMG Rust side (StopDecoder/Sequence).
+        let skip_special_tokens = true;
 
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
@@ -643,9 +636,8 @@ impl SglangSchedulerClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = request.stop_sequences.clone().unwrap_or_default();
 
-        // skip_special_tokens: false when tools are present (same logic as chat)
-        let skip_special_tokens =
-            tool_call_constraint.is_none() && request.tools.as_ref().is_none_or(|t| t.is_empty());
+        // Hardcode to true: gRPC backends return raw token IDs, not decoded text.
+        let skip_special_tokens = true;
 
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0) as f32,
