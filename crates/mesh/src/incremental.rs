@@ -83,6 +83,12 @@ struct LastScannedGenerations {
 #[expect(dead_code, reason = "Reserved for Layer 2 snapshot interval")]
 const STRUCTURE_SNAPSHOT_INTERVAL: u64 = 30;
 
+/// Maximum LZ4-compressed size for a single tree snapshot. Snapshots larger
+/// than this are skipped to prevent the infinite retry loop where an oversized
+/// snapshot is serialized, rejected by the gRPC size limit, and re-tried every
+/// round — ~23 MB/s of allocator churn that the OS never reclaims.
+const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Get current timestamp in nanoseconds. Module-level so both the legacy
 /// IncrementalUpdateCollector and the new CentralCollector can use it.
 #[expect(
@@ -350,11 +356,7 @@ impl IncrementalUpdateCollector {
                         }
                     }
 
-                    // Phase 1 (removed): tree_ops_pending is no longer populated.
-                    // Full prompt text is not stored per-request. Instead,
-                    // checkpoint_tree_states exports from the live radix tree.
-
-                    // Phase 2: Scan tree_configs for keys not yet emitted
+                    // Phase 1: Scan tree_configs for keys not yet emitted
                     // (e.g., after checkpoint + buffer drain, or remote-only entries).
                     //
                     // tree_configs may contain either:
@@ -362,7 +364,7 @@ impl IncrementalUpdateCollector {
                     //   - TreeSnapshot bytes (from local checkpoint_tree_states)
                     // Both are sent LZ4-compressed as "tree_state_lz4". The
                     // receiver detects the format and converts as needed.
-                    let phase2_start = updates.len();
+                    let phase1_start = updates.len();
                     for entry in &self.stores.tree_configs {
                         let key = entry.key();
                         if emitted_tree_keys.contains(key.as_str()) {
@@ -398,11 +400,6 @@ impl IncrementalUpdateCollector {
                         };
                         let compressed = lz4_compress(&config_bytes);
                         // Skip if compressed size exceeds the gRPC message limit.
-                        // This prevents the infinite retry loop where an oversized
-                        // snapshot is serialized every round, rejected by the
-                        // controller, and retried — causing ~23 MB/s of allocator
-                        // churn that the OS never reclaims.
-                        const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024; // 8 MB
                         if compressed.len() > MAX_SNAPSHOT_BYTES {
                             debug!(
                                 key = %key,
@@ -441,15 +438,15 @@ impl IncrementalUpdateCollector {
                         }
                     }
 
-                    // Phase 2 summary
-                    let phase2_count = updates.len() - phase2_start;
-                    let phase2_bytes: usize =
-                        updates[phase2_start..].iter().map(|u| u.value.len()).sum();
+                    // Phase 1 summary
+                    let phase1_count = updates.len() - phase1_start;
+                    let phase1_bytes: usize =
+                        updates[phase1_start..].iter().map(|u| u.value.len()).sum();
                     debug!(
-                        phase2_updates = phase2_count,
-                        phase2_total_bytes = phase2_bytes,
-                        "Phase 2: tree_configs scan {}",
-                        if phase2_count > 0 {
+                        phase1_updates = phase1_count,
+                        phase1_total_bytes = phase1_bytes,
+                        "Phase 1: tree_configs scan {}",
+                        if phase1_count > 0 {
                             "produced updates"
                         } else {
                             "no new updates"
@@ -609,7 +606,7 @@ pub struct DrainedTenantDeltas {
     /// These are Policy-type updates with key "tree:{model_id}".
     pub updates: Vec<StateUpdate>,
     /// Set of tree keys emitted as deltas. Used to skip these keys in
-    /// Phase 2 (tree_configs full-state scan) so the same model isn't sent twice.
+    /// Phase 1 (tree_configs full-state scan) so the same model isn't sent twice.
     pub emitted_tree_keys: std::collections::HashSet<String>,
 }
 
@@ -844,7 +841,8 @@ impl CentralCollector {
                 )
             }
             StoreType::RateLimit => {
-                let current_timestamp = current_timestamp();
+                // Reuse outer `timestamp` — the RateLimit branch previously
+                // called current_timestamp() again for no meaningful difference.
                 let mut updates = Vec::new();
                 for (key, actor, counter_value) in self.stores.rate_limit.all_shards() {
                     if !self.stores.rate_limit.is_owner(&key) {
@@ -854,9 +852,9 @@ impl CentralCollector {
                         updates.push(StateUpdate {
                             key,
                             value: serialized,
-                            version: current_timestamp,
+                            version: timestamp,
                             actor,
-                            timestamp: current_timestamp,
+                            timestamp,
                         });
                     }
                 }
@@ -941,7 +939,7 @@ impl CentralCollector {
         updates.extend(drained.updates);
         emitted_tree_keys.extend(drained.emitted_tree_keys);
 
-        // Phase 2: tree_configs scan for keys not emitted as deltas.
+        // Phase 1: tree_configs scan for keys not emitted as deltas.
         //
         // Collect (key, value) snapshots FIRST so DashMap shard locks are
         // released before the slow per-entry work (TreeSnapshot/TreeState
@@ -972,7 +970,6 @@ impl CentralCollector {
                 continue;
             };
             let compressed = lz4_compress(&config_bytes);
-            const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
             if compressed.len() > MAX_SNAPSHOT_BYTES {
                 debug!(
                     key = %key,
