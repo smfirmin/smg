@@ -85,6 +85,10 @@ pub struct McpToolSession<'a> {
     exposed_name_by_qualified: HashMap<QualifiedToolName, String>,
     /// Internal server keys for this request snapshot.
     internal_server_keys: HashSet<String>,
+    /// Builtin-routed server keys for this request snapshot.
+    builtin_server_keys: HashSet<String>,
+    /// Internal, non-builtin server labels for this request snapshot.
+    internal_non_builtin_server_labels: HashSet<String>,
 }
 
 impl<'a> McpToolSession<'a> {
@@ -140,6 +144,24 @@ impl<'a> McpToolSession<'a> {
                 }
             })
             .collect();
+        let builtin_server_keys: HashSet<String> = mcp_servers
+            .iter()
+            .filter_map(|binding| {
+                if configured_builtin_servers.contains(&binding.server_key) {
+                    Some(binding.server_key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let internal_non_builtin_server_labels: HashSet<String> = mcp_servers
+            .iter()
+            .filter(|binding| {
+                internal_server_keys.contains(&binding.server_key)
+                    && !builtin_server_keys.contains(&binding.server_key)
+            })
+            .map(|binding| binding.label.clone())
+            .collect();
         // Filter out servers configured with builtin_type from the visible list.
         let visible_mcp_servers: Vec<McpServerBinding> = mcp_servers
             .iter()
@@ -157,6 +179,8 @@ impl<'a> McpToolSession<'a> {
             exposed_name_map,
             exposed_name_by_qualified,
             internal_server_keys,
+            builtin_server_keys,
+            internal_non_builtin_server_labels,
         }
     }
 
@@ -347,26 +371,8 @@ impl<'a> McpToolSession<'a> {
     /// Use this helper in redaction paths so internal filtering behavior stays
     /// consistent across response assembly code paths.
     pub fn is_internal_non_builtin_server_label(&self, server_label: &str) -> bool {
-        if !self.is_internal_server_label(server_label) {
-            return false;
-        }
-
-        let mut has_exposed_binding_for_label = false;
-        for binding in self.exposed_name_map.values() {
-            if binding.server_label != server_label {
-                continue;
-            }
-
-            has_exposed_binding_for_label = true;
-            if self.is_internal_server_key(&binding.associated_server_key)
-                && !binding.is_builtin_routed
-            {
-                return true;
-            }
-        }
-
-        // If no tools are exposed under this label, treat internal labels as non-builtin.
-        !has_exposed_binding_for_label
+        self.internal_non_builtin_server_labels
+            .contains(server_label)
     }
 
     /// Returns true if the given tool resolves to an internal server.
@@ -378,9 +384,9 @@ impl<'a> McpToolSession<'a> {
 
     /// Returns true if the bound server label belongs to a builtin-routed server.
     pub fn is_builtin_server_label(&self, server_label: &str) -> bool {
-        self.exposed_name_map
-            .values()
-            .any(|binding| binding.server_label == server_label && binding.is_builtin_routed)
+        self.all_mcp_servers.iter().any(|binding| {
+            binding.label == server_label && self.builtin_server_keys.contains(&binding.server_key)
+        })
     }
 
     /// Returns true if the given tool resolves to a builtin-routed server.
@@ -462,7 +468,11 @@ impl<'a> McpToolSession<'a> {
     /// 1. `mcp_list_tools` items (one per server) — prepended
     /// 2. `tool_call_items` (mcp_call / web_search_call / etc.) — after list_tools
     /// 3. Existing items (messages, etc.) — remain at end
-    pub fn inject_mcp_output_items(
+    ///
+    /// Test-only helper for legacy ordering assertions.
+    /// Production code should use `inject_client_visible_mcp_output_items`.
+    #[cfg(test)]
+    fn inject_mcp_output_items(
         &self,
         output: &mut Vec<openai_protocol::responses::ResponseOutputItem>,
         tool_call_items: Vec<openai_protocol::responses::ResponseOutputItem>,
@@ -482,6 +492,181 @@ impl<'a> McpToolSession<'a> {
 
         // 3. Existing items (messages, etc.)
         output.extend(existing);
+    }
+
+    /// Inject only client-visible MCP metadata and call items into response output.
+    ///
+    /// Visibility policy:
+    /// - Hide builtin `mcp_list_tools` (builtin tools surface under their own type)
+    /// - Hide internal non-builtin `mcp_list_tools`
+    /// - Hide internal non-builtin passthrough `mcp_call`/`mcp_approval_request`
+    /// - Keep builtin-routed call items visible
+    /// - Keep user-defined function calls visible even on name collisions
+    pub fn inject_client_visible_mcp_output_items(
+        &self,
+        output: &mut Vec<openai_protocol::responses::ResponseOutputItem>,
+        tool_call_items: Vec<openai_protocol::responses::ResponseOutputItem>,
+        user_function_names: &HashSet<String>,
+    ) {
+        let existing = std::mem::take(output);
+        output.reserve(self.mcp_servers.len() + tool_call_items.len() + existing.len());
+
+        // Use mcp_servers (excludes builtin) to match streaming path behavior.
+        for binding in &self.mcp_servers {
+            if !self.is_internal_non_builtin_server_label(&binding.label) {
+                output.push(self.build_mcp_list_tools_item(&binding.label, &binding.server_key));
+            }
+        }
+
+        for item in tool_call_items {
+            if self.is_client_visible_output_item(&item, user_function_names) {
+                output.push(item);
+            }
+        }
+
+        // Apply the same visibility policy to existing items (e.g. FunctionToolCall
+        // for executed MCP tools emitted by build_tool_response in the mixed
+        // function+MCP early-exit path).
+        for item in existing {
+            if self.is_client_visible_output_item(&item, user_function_names) {
+                output.push(item);
+            }
+        }
+    }
+
+    fn is_client_visible_output_item(
+        &self,
+        item: &openai_protocol::responses::ResponseOutputItem,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        use openai_protocol::responses::ResponseOutputItem;
+
+        match item {
+            ResponseOutputItem::McpListTools { server_label, .. } => {
+                !self.is_builtin_server_label(server_label)
+                    && !self.is_internal_non_builtin_server_label(server_label)
+            }
+            ResponseOutputItem::McpCall {
+                server_label, name, ..
+            }
+            | ResponseOutputItem::McpApprovalRequest {
+                server_label, name, ..
+            } => !self.should_hide_mcp_call_like_by_label(name, server_label),
+            ResponseOutputItem::FunctionToolCall { name, .. } => {
+                !self.should_hide_function_call_like(name, user_function_names)
+            }
+            ResponseOutputItem::WebSearchCall { .. }
+            | ResponseOutputItem::CodeInterpreterCall { .. }
+            | ResponseOutputItem::FileSearchCall { .. }
+            | ResponseOutputItem::Message { .. }
+            | ResponseOutputItem::Reasoning { .. } => true,
+        }
+    }
+
+    /// Returns true when a JSON tool entry should be hidden from client-facing responses.
+    ///
+    /// This is used by OpenAI non-streaming response normalization, where tools are handled
+    /// as `serde_json::Value` payloads instead of typed `ResponseOutputItem`s.
+    pub fn should_hide_tool_json(
+        &self,
+        tool: &serde_json::Value,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        match tool.get("type").and_then(|value| value.as_str()) {
+            Some("function") => Self::function_tool_name_json(tool)
+                .is_some_and(|name| self.should_hide_function_call_like(name, user_function_names)),
+            // MCP tool entries are keyed by server metadata, so function-name collision
+            // handling does not apply to this arm.
+            Some("mcp") => tool
+                .get("server_label")
+                .and_then(|value| value.as_str())
+                .is_some_and(|server_label| {
+                    self.is_internal_non_builtin_server_label(server_label)
+                }),
+            _ => false,
+        }
+    }
+
+    /// Returns true when a JSON output item should be hidden from client-facing responses.
+    ///
+    /// This keeps OpenAI non-streaming redaction aligned with session-level policy.
+    pub fn should_hide_output_item_json(
+        &self,
+        item: &serde_json::Value,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        match item.get("type").and_then(|value| value.as_str()) {
+            // mcp_list_tools is gateway-synthesized metadata. Hide for builtin servers
+            // (implementation detail) and internal non-builtin servers (privacy).
+            Some("mcp_list_tools") => item
+                .get("server_label")
+                .and_then(|value| value.as_str())
+                .is_some_and(|server_label| {
+                    self.is_builtin_server_label(server_label)
+                        || self.is_internal_non_builtin_server_label(server_label)
+                }),
+            Some("mcp_call") | Some("mcp_approval_request") => {
+                let matches_internal_server = item
+                    .get("server_label")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|server_label| {
+                        self.is_internal_non_builtin_server_label(server_label)
+                    });
+
+                match item.get("name").and_then(|value| value.as_str()) {
+                    Some(name) => {
+                        self.should_hide_mcp_call_like_by_server_flag(name, matches_internal_server)
+                    }
+                    _ => matches_internal_server,
+                }
+            }
+            Some("function_call") | Some("function_tool_call") => item
+                .get("name")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| self.should_hide_function_call_like(name, user_function_names)),
+            _ => false,
+        }
+    }
+
+    fn should_hide_mcp_call_like_by_label(&self, name: &str, server_label: &str) -> bool {
+        self.should_hide_mcp_call_like_by_server_flag(
+            name,
+            self.is_internal_non_builtin_server_label(server_label),
+        )
+    }
+
+    fn should_hide_mcp_call_like_by_server_flag(
+        &self,
+        name: &str,
+        matches_internal_server: bool,
+    ) -> bool {
+        if self.has_exposed_tool(name) {
+            self.is_internal_non_builtin_tool(name)
+        } else {
+            matches_internal_server
+        }
+    }
+
+    fn should_hide_function_call_like(
+        &self,
+        name: &str,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        self.is_internal_tool(name) && !user_function_names.contains(name)
+    }
+
+    fn function_tool_name_json(tool: &serde_json::Value) -> Option<&str> {
+        let tool_type = tool.get("type").and_then(|value| value.as_str());
+        if tool_type != Some("function") {
+            return None;
+        }
+        tool.get("name")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(|value| value.as_str())
+            })
     }
 
     fn build_exposed_function_tools(
