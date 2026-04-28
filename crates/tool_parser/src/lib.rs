@@ -15,10 +15,11 @@ pub mod parsers;
 mod tests;
 
 // Re-export types used outside this module
-pub use factory::{ParserFactory, PooledParser};
+pub use factory::{ParserFactory, PooledParser, ToolConstraint};
 pub use parsers::{
-    CohereParser, DeepSeek31Parser, DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser,
-    LlamaParser, MinimaxM2Parser, MistralParser, PythonicParser, QwenParser, Step3Parser,
+    CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser, JsonParser,
+    KimiK2Parser, LlamaParser, MinimaxM2Parser, MistralParser, PythonicParser, QwenParser,
+    Step3Parser,
 };
 pub use traits::ToolParser;
 pub use types::{FunctionCall, PartialToolCall, StreamingParseResult, ToolCall};

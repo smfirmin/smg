@@ -13,14 +13,16 @@ use tracing::warn;
 
 use super::utils::{patch_response_with_request_metadata, restore_original_tools};
 use crate::routers::{
-    error,
-    header_utils::ApiProvider,
-    mcp_utils::ensure_request_mcp_client,
-    openai::{
-        context::{PayloadState, RequestContext},
-        mcp::{execute_tool_loop, prepare_mcp_tools_as_functions},
+    common::{
+        header_utils::{extract_forwardable_request_headers, ApiProvider},
+        mcp_utils::ensure_request_mcp_client,
+        persistence_utils::persist_conversation_items,
     },
-    persistence_utils::persist_conversation_items,
+    error,
+    openai::{
+        context::{PayloadState, RequestContext, ResponsesPayloadState},
+        mcp::{execute_tool_loop, prepare_mcp_tools_as_functions, ToolLoopExecutionContext},
+    },
 };
 
 /// Handle a non-streaming responses request
@@ -35,8 +37,11 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
     let PayloadState {
         json: mut payload,
         url,
-        previous_response_id,
     } = payload_state;
+    let ResponsesPayloadState {
+        previous_response_id,
+        existing_mcp_list_tools_labels,
+    } = ctx.take_responses_payload().unwrap_or_default();
 
     let original_body = match ctx.responses_request() {
         Some(r) => r,
@@ -71,7 +76,16 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             .request_id
             .clone()
             .unwrap_or_else(|| format!("req_{}", uuid::Uuid::now_v7()));
-        let session = McpToolSession::new(mcp_orchestrator, mcp_servers, &session_request_id);
+        let forwarded_headers = extract_forwardable_request_headers(ctx.headers());
+        let mut session = McpToolSession::new_with_headers(
+            mcp_orchestrator,
+            mcp_servers,
+            &session_request_id,
+            forwarded_headers,
+        );
+        if let Some(tools) = original_body.tools.as_deref() {
+            session.configure_response_tools_approval(tools);
+        }
         prepare_mcp_tools_as_functions(&mut payload, &session);
 
         match execute_tool_loop(
@@ -80,8 +94,11 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             ctx.headers(),
             worker.api_key(),
             payload,
-            original_body,
-            &session,
+            ToolLoopExecutionContext {
+                original_body,
+                existing_mcp_list_tools_labels: &existing_mcp_list_tools_labels,
+                session: &session,
+            },
         )
         .await
         {
@@ -94,6 +111,8 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
                 return error::internal_error("upstream_error", err);
             }
         }
+
+        restore_original_tools(&mut response_json, original_body, Some(&session));
     } else {
         let mut request_builder = ctx.components.client().post(&url).json(&payload);
         let provider = ApiProvider::from_url(&url);
@@ -136,9 +155,9 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
                 );
             }
         };
-    }
 
-    restore_original_tools(&mut response_json, original_body);
+        restore_original_tools(&mut response_json, original_body, None);
+    }
     patch_response_with_request_metadata(
         &mut response_json,
         original_body,

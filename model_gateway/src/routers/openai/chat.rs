@@ -20,13 +20,17 @@ use super::{
 };
 use crate::{
     config::types::RetryConfig,
+    middleware::TenantRequestMeta,
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     routers::{
+        common::{
+            header_utils::{apply_provider_headers, extract_auth_header},
+            retry::{is_retryable_status, RetryExecutor},
+            worker_selection::{SelectWorkerRequest, WorkerSelector},
+        },
         error,
-        header_utils::{apply_provider_headers, extract_auth_header},
-        worker_selection::{SelectWorkerRequest, WorkerSelector},
     },
-    worker::{is_retryable_status, Endpoint, ProviderType, RetryExecutor, WorkerRegistry},
+    worker::{Endpoint, ProviderType, WorkerRegistry},
 };
 
 /// Shared context passed to chat routing functions.
@@ -41,6 +45,7 @@ pub(super) struct ChatRouterContext<'a> {
 pub(super) async fn route_chat(
     deps: &ChatRouterContext<'_>,
     headers: Option<&HeaderMap>,
+    tenant_meta: &TenantRequestMeta,
     body: &ChatCompletionRequest,
     model_id: &str,
 ) -> Response {
@@ -121,6 +126,7 @@ pub(super) async fn route_chat(
         Some(model_id.to_string()),
         ComponentRefs::Shared(Arc::clone(deps.shared_components)),
     );
+    ctx.tenant_request_meta = Some(tenant_meta.clone());
 
     ctx.state.worker = Some(WorkerSelection {
         worker: Arc::clone(&worker),
@@ -131,7 +137,6 @@ pub(super) async fn route_chat(
     ctx.state.payload = Some(PayloadState {
         json: payload,
         url: url.clone(),
-        previous_response_id: None,
     });
 
     // Wrap values in Arc to avoid cloning large objects on each retry attempt

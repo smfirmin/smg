@@ -31,7 +31,7 @@ struct ParserTestContext {
 impl ParserTestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         // Create router config with parser support enabled
-        let config = RouterConfig::builder()
+        let mut config = RouterConfig::builder()
             .regular_mode(vec![])
             .random_policy()
             .host("127.0.0.1")
@@ -43,6 +43,7 @@ impl ParserTestContext {
             .max_concurrent_requests(64)
             .queue_timeout_secs(60)
             .build_unchecked();
+        config.health_check.disable_health_check = true;
 
         Self::new_with_config(config, worker_configs).await
     }
@@ -71,17 +72,11 @@ impl ParserTestContext {
         match &mut config.mode {
             RoutingMode::Regular {
                 worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    urls.clone_from(&worker_urls);
-                }
             }
-            RoutingMode::OpenAI {
+            | RoutingMode::OpenAI {
                 worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    urls.clone_from(&worker_urls);
-                }
+            } if urls.is_empty() => {
+                urls.clone_from(&worker_urls);
             }
             _ => {} // PrefillDecode mode has its own setup
         }

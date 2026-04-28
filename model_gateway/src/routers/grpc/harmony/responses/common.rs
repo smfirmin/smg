@@ -1,16 +1,19 @@
 //! Shared helpers and state tracking for Harmony Responses
 
+use std::collections::HashSet;
+
 use axum::response::Response;
 use openai_protocol::{
-    common::{ToolCall, ToolChoice, ToolChoiceValue},
+    common::ToolCall,
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-        ResponseReasoningContent, ResponsesRequest, ResponsesResponse, StringOrContentParts,
+        ResponseReasoningContent, ResponseTool, ResponsesRequest, ResponsesResponse,
+        ResponsesToolChoice, StringOrContentParts, ToolChoiceOptions,
     },
 };
 use serde_json::{from_value, to_string, Value};
 use smg_data_connector::{ResponseId, ResponseStorageError};
-use smg_mcp::McpToolSession;
+use smg_mcp::{McpToolSession, ResponseFormat};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -75,6 +78,7 @@ pub(super) fn build_next_request_with_tools(
                 content: StringOrContentParts::String(text),
                 role: "user".to_string(),
                 r#type: None,
+                phase: None,
             }]
         }
     };
@@ -85,14 +89,14 @@ pub(super) fn build_next_request_with_tools(
 
     // Add reasoning if present (from analysis channel)
     if let Some(analysis_text) = analysis {
-        items.push(ResponseInputOutputItem::Reasoning {
-            id: format!("reasoning_{assistant_id}"),
-            summary: vec![],
-            content: vec![ResponseReasoningContent::ReasoningText {
+        items.push(ResponseInputOutputItem::new_reasoning(
+            format!("reasoning_{assistant_id}"),
+            vec![],
+            vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
             }],
-            status: Some("completed".to_string()),
-        });
+            Some("completed".to_string()),
+        ));
     }
 
     // Add message content if present (from final channel)
@@ -106,6 +110,7 @@ pub(super) fn build_next_request_with_tools(
                 logprobs: None,
             }],
             status: Some("completed".to_string()),
+            phase: None,
         });
     }
 
@@ -155,7 +160,7 @@ pub(super) fn build_next_request_with_tools(
     // Switch tool_choice to "auto" for subsequent iterations
     // This prevents infinite loops when original tool_choice was "required" or specific function
     // After receiving tool results, the model should be free to decide whether to call more tools or finish
-    request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    request.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto));
 
     request
 }
@@ -164,6 +169,7 @@ pub(super) fn inject_mcp_metadata(
     response: &mut ResponsesResponse,
     tracking: &McpCallTracking,
     session: &McpToolSession<'_>,
+    user_function_names: &HashSet<String>,
 ) {
     let tool_output_items: Vec<ResponseOutputItem> = tracking
         .tool_calls
@@ -171,7 +177,11 @@ pub(super) fn inject_mcp_metadata(
         .map(|record| record.output_item.clone())
         .collect();
 
-    session.inject_mcp_output_items(&mut response.output, tool_output_items);
+    session.inject_client_visible_mcp_output_items(
+        &mut response.output,
+        tool_output_items,
+        user_function_names,
+    );
 }
 
 /// Load previous conversation messages from storage
@@ -278,6 +288,7 @@ pub(super) async fn load_previous_messages(
                 content: StringOrContentParts::String(text),
                 role: "user".to_string(),
                 r#type: None,
+                phase: None,
             });
             history_items
         }
@@ -288,4 +299,56 @@ pub(super) async fn load_previous_messages(
     modified_request.previous_response_id = None;
 
     Ok(modified_request)
+}
+
+/// Strip `ResponseTool::ImageGeneration` from a request's tools list once
+/// the MCP session has exposed an MCP-routed replacement.
+///
+/// The harmony builder synthesizes a function-tool description named
+/// `image_generation` from
+/// [`openai_protocol::responses::ResponseTool::ImageGeneration`]. That is
+/// the right advertisement when no MCP server is configured, but once the
+/// MCP loop injects a `ResponseTool::Function` for the MCP-exposed
+/// image-generation tool (via `convert_mcp_tools_to_response_tools`), two
+/// function-tool entries can end up in the developer-message `namespace
+/// functions { … }`. Worse, if the MCP server is configured with a
+/// non-canonical `builtin_tool_name` (e.g. `generate_image`), the
+/// advertised `image_generation` synthesis will not be recognized as
+/// MCP-exposed by `McpToolSession::has_exposed_tool`, so any call the
+/// model makes against the synthesized name falls through to the
+/// unresolved function-call path instead of dispatching.
+///
+/// Removing the `ResponseTool::ImageGeneration` tag once the MCP loop has
+/// taken ownership keeps the advertisement single-source (the MCP-exposed
+/// Function tool) and guarantees the model only sees a name the session
+/// can dispatch against.
+pub(super) fn strip_image_generation_from_request_tools(
+    request: &mut ResponsesRequest,
+    session: &McpToolSession<'_>,
+) {
+    // Check whether any MCP tool in the session carries the
+    // `ImageGenerationCall` response format — this is the authoritative
+    // signal that an MCP server is routed for the hosted
+    // `image_generation` tool in this request.
+    let mcp_has_image_generation = session
+        .mcp_tools()
+        .iter()
+        .any(|entry| matches!(entry.response_format, ResponseFormat::ImageGenerationCall));
+
+    if !mcp_has_image_generation {
+        return;
+    }
+
+    if let Some(tools) = request.tools.as_mut() {
+        let before = tools.len();
+        tools.retain(|t| !matches!(t, ResponseTool::ImageGeneration(_)));
+        let after = tools.len();
+        if before != after {
+            debug!(
+                removed = before - after,
+                "Stripped ResponseTool::ImageGeneration from request.tools because the \
+                 MCP session exposes an image_generation-routed dispatcher",
+            );
+        }
+    }
 }

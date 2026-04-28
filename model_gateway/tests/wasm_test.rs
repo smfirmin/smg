@@ -30,10 +30,11 @@ use smg::{
         },
         module_manager::WasmModuleManager,
     },
-    worker::{LoadMonitor, WorkerRegistry},
+    worker::{WorkerMonitor, WorkerRegistry},
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    NoOpConversationMemoryWriter,
 };
 use tempfile::TempDir;
 use tokio::fs;
@@ -59,13 +60,16 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let response_storage = Arc::new(MemoryResponseStorage::new());
     let conversation_storage = Arc::new(MemoryConversationStorage::new());
     let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+    let conversation_memory_writer = Arc::new(NoOpConversationMemoryWriter::new());
 
-    // Initialize load monitor
-    let load_monitor = Some(Arc::new(LoadMonitor::new(
+    // Initialize the worker monitor with the same interval the
+    // production builder uses so tests exercise the real polling
+    // cadence.
+    let worker_monitor = Some(Arc::new(WorkerMonitor::new(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.worker_startup_check_interval_secs,
+        config.load_monitor_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -87,7 +91,8 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
             .response_storage(response_storage)
             .conversation_storage(conversation_storage)
             .conversation_item_storage(conversation_item_storage)
-            .load_monitor(load_monitor)
+            .conversation_memory_writer(conversation_memory_writer)
+            .worker_monitor(worker_monitor)
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
             .mcp_orchestrator(mcp_orchestrator_lock)
@@ -95,6 +100,13 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
             .build()
             .expect("Failed to build AppContext with WASM manager"),
     );
+
+    // Mirror production wiring: start the WorkerMonitor event loop so
+    // tests exercise the event-driven group reconciliation path
+    // instead of an inert monitor.
+    if let Some(monitor) = &app_context.worker_monitor {
+        monitor.start_event_loop();
+    }
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
@@ -188,6 +200,10 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper assumes router config is already validated"
+    )]
     let app = build_app(
         app_state,
         smg::middleware::AuthConfig::new(None),
@@ -195,7 +211,8 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         256 * 1024 * 1024,
         request_id_headers,
         vec![], // cors_allowed_origins
-    );
+    )
+    .expect("valid tenant resolution config");
 
     (app, app_context, temp_dir)
 }

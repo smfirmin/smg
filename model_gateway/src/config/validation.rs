@@ -1,3 +1,5 @@
+use axum::http::HeaderName;
+
 use super::*;
 
 /// Configuration validator
@@ -9,7 +11,7 @@ impl ConfigValidator {
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
-
+        Self::validate_tenant_resolution(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -41,6 +43,139 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        Self::validate_skills(config)?;
+        Self::validate_background(&config.background)?;
+
+        Ok(())
+    }
+
+    fn validate_background(bg: &BackgroundConfig) -> ConfigResult<()> {
+        let zero_checks = [
+            (
+                "background.worker_concurrency",
+                u64::from(bg.worker_concurrency),
+            ),
+            ("background.max_queue_depth", u64::from(bg.max_queue_depth)),
+            ("background.lease_duration_secs", bg.lease_duration_secs),
+            ("background.max_retries", u64::from(bg.max_retries)),
+            ("background.retry_base_delay_secs", bg.retry_base_delay_secs),
+            ("background.retry_max_delay_secs", bg.retry_max_delay_secs),
+            ("background.sweep_interval_secs", bg.sweep_interval_secs),
+            ("background.poll_interval_ms", bg.poll_interval_ms),
+            ("background.stream_retention_secs", bg.stream_retention_secs),
+        ];
+        for (field, value) in zero_checks {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: "Must be > 0".to_string(),
+                });
+            }
+        }
+        if bg.retry_base_delay_secs > bg.retry_max_delay_secs {
+            return Err(ConfigError::InvalidValue {
+                field: "background.retry_base_delay_secs".to_string(),
+                value: bg.retry_base_delay_secs.to_string(),
+                reason: format!(
+                    "Must be <= retry_max_delay_secs ({})",
+                    bg.retry_max_delay_secs
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_skills(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.skills_enabled {
+            return Ok(());
+        }
+
+        let skills = config.skills.as_ref().ok_or_else(|| ConfigError::ValidationFailed {
+            reason: "skills are enabled but no skills config was provided; set --skills-config-path or preload RouterConfig.skills"
+                .to_string(),
+        })?;
+
+        Self::validate_skills_config(skills)
+    }
+
+    fn validate_skills_config(skills: &SkillsConfig) -> ConfigResult<()> {
+        if skills.blob_store.path.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "skills.blob_store.path".to_string(),
+                value: skills.blob_store.path.clone(),
+                reason: "filesystem blob-store path must not be empty".to_string(),
+            });
+        }
+
+        if skills.cache.enabled() && skills.cache.path.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "skills.cache.path".to_string(),
+                value: skills.cache.path.clone(),
+                reason: "enabled blob cache path must not be empty".to_string(),
+            });
+        }
+
+        if skills.max_upload_size_mb == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "skills.max_upload_size_mb".to_string(),
+                value: skills.max_upload_size_mb.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        validate_mebibyte_limit("skills.max_upload_size_mb", skills.max_upload_size_mb)?;
+
+        if skills.max_file_size_mb == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "skills.max_file_size_mb".to_string(),
+                value: skills.max_file_size_mb.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        validate_mebibyte_limit("skills.max_file_size_mb", skills.max_file_size_mb)?;
+
+        if skills.max_file_size_mb > skills.max_upload_size_mb {
+            return Err(ConfigError::InvalidValue {
+                field: "skills.max_file_size_mb".to_string(),
+                value: skills.max_file_size_mb.to_string(),
+                reason: "Must be <= skills.max_upload_size_mb".to_string(),
+            });
+        }
+
+        if skills.max_files_per_version == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "skills.max_files_per_version".to_string(),
+                value: skills.max_files_per_version.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if skills.max_skills_per_request == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "skills.max_skills_per_request".to_string(),
+                value: skills.max_skills_per_request.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        let has_executor_url = skills
+            .execution
+            .executor_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        let has_executor_api_key = skills
+            .execution
+            .executor_api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+
+        if has_executor_url && !has_executor_api_key {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "skills execution is enabled but skills.execution.executor_api_key is missing"
+                        .to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -74,6 +209,23 @@ impl ConfigValidator {
                 });
             }
         }
+
+        Ok(())
+    }
+
+    fn validate_tenant_resolution(config: &RouterConfig) -> ConfigResult<()> {
+        let header_name = config.tenant_resolution.tenant_header_name.trim();
+        if header_name.is_empty() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "tenant_resolution.tenant_header_name must not be empty".to_string(),
+            });
+        }
+
+        HeaderName::try_from(header_name).map_err(|e| ConfigError::ValidationFailed {
+            reason: format!(
+                "tenant_resolution.tenant_header_name must be a valid HTTP header name: {e}"
+            ),
+        })?;
 
         Ok(())
     }
@@ -717,6 +869,20 @@ impl ConfigValidator {
     }
 }
 
+fn validate_mebibyte_limit(field: &str, value_mb: usize) -> ConfigResult<()> {
+    const MEBIBYTE: usize = 1024 * 1024;
+
+    if value_mb.checked_mul(MEBIBYTE).is_none() {
+        return Err(ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: value_mb.to_string(),
+            reason: "Must fit into usize bytes".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,5 +1299,57 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_skills_enabled_requires_nested_config() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.skills_enabled = true;
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("skills are enabled but no skills config was provided"));
+    }
+
+    #[test]
+    fn test_validate_skills_execution_requires_api_key() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.skills_enabled = true;
+        let mut skills = SkillsConfig::default();
+        skills.execution.executor_url = Some("http://executor.internal".to_string());
+        config.skills = Some(skills);
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("skills.execution.executor_api_key is missing"));
+    }
+
+    #[test]
+    fn test_validate_skills_blob_store_path_must_not_be_empty() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.skills_enabled = true;
+        let mut skills = SkillsConfig::default();
+        skills.blob_store.path.clear();
+        config.skills = Some(skills);
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("skills.blob_store.path"));
     }
 }

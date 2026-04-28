@@ -1,4 +1,4 @@
-"""SMG gRPC Proto - Protocol definitions for SGLang, vLLM, and TRT-LLM."""
+"""SMG gRPC Proto - Protocol definitions for SGLang, vLLM, TRT-LLM, and MLX."""
 
 from importlib.metadata import PackageNotFoundError, version
 
@@ -11,6 +11,8 @@ except PackageNotFoundError:
 # These imports will work after the package is built (stubs generated at build time)
 try:
     from smg_grpc_proto.generated import (
+        mlx_engine_pb2,
+        mlx_engine_pb2_grpc,
         sglang_encoder_pb2,
         sglang_encoder_pb2_grpc,
         sglang_scheduler_pb2,
@@ -30,6 +32,8 @@ try:
         "vllm_engine_pb2_grpc",
         "trtllm_service_pb2",
         "trtllm_service_pb2_grpc",
+        "mlx_engine_pb2",
+        "mlx_engine_pb2_grpc",
     ]
 except ImportError:
     # During development/build, generated modules may not exist yet

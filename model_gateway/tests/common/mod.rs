@@ -31,12 +31,14 @@ use smg::{
     policies::PolicyRegistry,
     routers::{router_manager::RouterManager, RouterFactory, RouterTrait},
     worker::{
-        BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
+        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
+        WorkerType,
     },
     workflow::Job,
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    NoOpConversationMemoryWriter,
 };
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
@@ -177,7 +179,7 @@ impl AppTestContext {
         worker_configs: Vec<MockWorkerConfig>,
     ) -> Pin<Box<dyn Future<Output = Self> + Send>> {
         Box::pin(async move {
-            let config = RouterConfig::builder()
+            let mut config = RouterConfig::builder()
                 .regular_mode(vec![])
                 .random_policy()
                 .host("127.0.0.1")
@@ -189,6 +191,10 @@ impl AppTestContext {
                 .max_concurrent_requests(64)
                 .queue_timeout_secs(60)
                 .build_unchecked();
+            // Test mock workers don't need health checks — start Ready immediately.
+            // Tests that need to exercise Pending/Failed semantics should use
+            // `new_with_config()` with an explicit config.
+            config.health_check.disable_health_check = true;
 
             Self::new_with_config(config, worker_configs).await
         })
@@ -221,17 +227,11 @@ impl AppTestContext {
             match &mut config.mode {
                 RoutingMode::Regular {
                     worker_urls: ref mut urls,
-                } => {
-                    if urls.is_empty() {
-                        urls.clone_from(&worker_urls);
-                    }
                 }
-                RoutingMode::OpenAI {
+                | RoutingMode::OpenAI {
                     worker_urls: ref mut urls,
-                } => {
-                    if urls.is_empty() {
-                        urls.clone_from(&worker_urls);
-                    }
+                } if urls.is_empty() => {
+                    urls.clone_from(&worker_urls);
                 }
                 _ => {}
             }
@@ -344,13 +344,14 @@ pub fn create_test_context(
         let response_storage = Arc::new(MemoryResponseStorage::new());
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+        let conversation_memory_writer = Arc::new(NoOpConversationMemoryWriter::new());
 
         // Initialize load monitor
-        let load_monitor = Some(Arc::new(LoadMonitor::new(
+        let worker_monitor = Some(Arc::new(WorkerMonitor::new(
             worker_registry.clone(),
             policy_registry.clone(),
             client.clone(),
-            config.worker_startup_check_interval_secs,
+            config.load_monitor_interval_secs,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -371,13 +372,21 @@ pub fn create_test_context(
                 .response_storage(response_storage)
                 .conversation_storage(conversation_storage)
                 .conversation_item_storage(conversation_item_storage)
-                .load_monitor(load_monitor)
+                .conversation_memory_writer(conversation_memory_writer)
+                .worker_monitor(worker_monitor)
                 .worker_job_queue(worker_job_queue)
                 .workflow_engines(workflow_engines)
                 .mcp_orchestrator(mcp_orchestrator_lock)
                 .build()
                 .unwrap(),
         );
+
+        // Mirror production wiring: start the WorkerMonitor event
+        // loop so tests exercise the event-driven group reconciliation
+        // path instead of an inert monitor.
+        if let Some(monitor) = &app_context.worker_monitor {
+            monitor.start_event_loop();
+        }
 
         // Initialize JobQueue after AppContext is created
         let weak_context = Arc::downgrade(&app_context);
@@ -410,6 +419,10 @@ pub fn create_test_context(
                         .worker_type(WorkerType::Regular)
                         .runtime_type(RuntimeType::External)
                         .models(models)
+                        .health_config(openai_protocol::worker::HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
                         .build(),
                 );
                 app_context.worker_registry.register(worker);
@@ -475,13 +488,14 @@ pub fn create_test_context_with_parsers(
         let response_storage = Arc::new(MemoryResponseStorage::new());
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+        let conversation_memory_writer = Arc::new(NoOpConversationMemoryWriter::new());
 
         // Initialize load monitor
-        let load_monitor = Some(Arc::new(LoadMonitor::new(
+        let worker_monitor = Some(Arc::new(WorkerMonitor::new(
             worker_registry.clone(),
             policy_registry.clone(),
             client.clone(),
-            config.worker_startup_check_interval_secs,
+            config.load_monitor_interval_secs,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -506,13 +520,21 @@ pub fn create_test_context_with_parsers(
                 .response_storage(response_storage)
                 .conversation_storage(conversation_storage)
                 .conversation_item_storage(conversation_item_storage)
-                .load_monitor(load_monitor)
+                .conversation_memory_writer(conversation_memory_writer)
+                .worker_monitor(worker_monitor)
                 .worker_job_queue(worker_job_queue)
                 .workflow_engines(workflow_engines)
                 .mcp_orchestrator(mcp_orchestrator_lock)
                 .build()
                 .unwrap(),
         );
+
+        // Mirror production wiring: start the WorkerMonitor event
+        // loop so tests exercise the event-driven group reconciliation
+        // path instead of an inert monitor.
+        if let Some(monitor) = &app_context.worker_monitor {
+            monitor.start_event_loop();
+        }
 
         // Initialize JobQueue after AppContext is created
         let weak_context = Arc::downgrade(&app_context);
@@ -545,6 +567,10 @@ pub fn create_test_context_with_parsers(
                         .worker_type(WorkerType::Regular)
                         .runtime_type(RuntimeType::External)
                         .models(models)
+                        .health_config(openai_protocol::worker::HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
                         .build(),
                 );
                 app_context.worker_registry.register(worker);
@@ -613,13 +639,14 @@ pub fn create_test_context_with_mcp_config(
         let response_storage = Arc::new(MemoryResponseStorage::new());
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+        let conversation_memory_writer = Arc::new(NoOpConversationMemoryWriter::new());
 
         // Initialize load monitor
-        let load_monitor = Some(Arc::new(LoadMonitor::new(
+        let worker_monitor = Some(Arc::new(WorkerMonitor::new(
             worker_registry.clone(),
             policy_registry.clone(),
             client.clone(),
-            config.worker_startup_check_interval_secs,
+            config.load_monitor_interval_secs,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -640,13 +667,21 @@ pub fn create_test_context_with_mcp_config(
                 .response_storage(response_storage)
                 .conversation_storage(conversation_storage)
                 .conversation_item_storage(conversation_item_storage)
-                .load_monitor(load_monitor)
+                .conversation_memory_writer(conversation_memory_writer)
+                .worker_monitor(worker_monitor)
                 .worker_job_queue(worker_job_queue)
                 .workflow_engines(workflow_engines)
                 .mcp_orchestrator(mcp_orchestrator_lock)
                 .build()
                 .unwrap(),
         );
+
+        // Mirror production wiring: start the WorkerMonitor event
+        // loop so tests exercise the event-driven group reconciliation
+        // path instead of an inert monitor.
+        if let Some(monitor) = &app_context.worker_monitor {
+            monitor.start_event_loop();
+        }
 
         // Initialize JobQueue after AppContext is created
         let weak_context = Arc::downgrade(&app_context);
@@ -679,6 +714,10 @@ pub fn create_test_context_with_mcp_config(
                         .worker_type(WorkerType::Regular)
                         .runtime_type(RuntimeType::External)
                         .models(models)
+                        .health_config(openai_protocol::worker::HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
                         .build(),
                 );
                 app_context.worker_registry.register(worker);

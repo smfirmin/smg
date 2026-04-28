@@ -16,6 +16,9 @@ Metrics are exposed on the Prometheus port (default: `29000`):
 curl http://localhost:29000/metrics
 ```
 
+The same listener also serves a WebSocket stream of real-time metric updates
+at `/ws/metrics` (used by the TUI and dashboards that need live state).
+
 Configure via CLI:
 
 ```bash
@@ -66,11 +69,11 @@ rate(smg_http_request_duration_seconds_sum[5m]) / rate(smg_http_request_duration
 
 ### `smg_http_responses_total`
 
-HTTP responses by status and error code.
+HTTP responses by path, status, and error code.
 
 | Type | Labels |
 |------|--------|
-| Counter | `status_code`, `error_code` |
+| Counter | `path`, `status_code`, `error_code` |
 
 ```promql
 # Error rate (5xx responses)
@@ -78,6 +81,11 @@ sum(rate(smg_http_responses_total{status_code=~"5.."}[5m])) / sum(rate(smg_http_
 
 # Success rate
 sum(rate(smg_http_responses_total{status_code="200"}[5m])) / sum(rate(smg_http_responses_total[5m]))
+
+# Success rate for /v1/responses
+sum(rate(smg_http_responses_total{path="/v1/responses",status_code=~"2.."}[5m]))
+/
+sum(rate(smg_http_responses_total{path="/v1/responses"}[5m]))
 ```
 
 ---
@@ -110,13 +118,13 @@ Rate limiting decisions.
 
 | Type | Labels |
 |------|--------|
-| Counter | `decision` |
+| Counter | `result` |
 
 Values: `allowed`, `rejected`
 
 ```promql
 # Rejection rate
-rate(smg_http_rate_limit_total{decision="rejected"}[5m]) / sum(rate(smg_http_rate_limit_total[5m]))
+rate(smg_http_rate_limit_total{result="rejected"}[5m]) / sum(rate(smg_http_rate_limit_total[5m]))
 ```
 
 ---
@@ -133,9 +141,10 @@ Requests processed by the router.
 |------|--------|
 | Counter | `router_type`, `backend_type`, `connection_mode`, `model`, `endpoint`, `streaming` |
 
-Router types: `grpc`, `http`, `third_party`
-Backend types: `grpc`, `http`, `external`
-Endpoints: `chat`, `generate`, `embeddings`, `rerank`, `responses`
+Router types: `openai`, `http`, `grpc`
+Backend types: `regular`, `pd`, `external`, `harmony`
+Endpoints: `chat`, `generate`, `responses`, `completions`, `rerank`, `embeddings`, `classify`, `messages`, `realtime`, `realtime_sessions`, `realtime_client_secrets`, `realtime_transcription`
+Streaming: `true`, `false`
 
 ```promql
 # Request rate by model
@@ -153,7 +162,7 @@ Total router request duration.
 
 | Type | Labels |
 |------|--------|
-| Histogram | `router_type`, `backend_type`, `model`, `endpoint` |
+| Histogram | `router_type`, `backend_type`, `connection_mode`, `model`, `endpoint` |
 
 ---
 
@@ -163,9 +172,9 @@ Router errors by type.
 
 | Type | Labels |
 |------|--------|
-| Counter | `router_type`, `error_type` |
+| Counter | `router_type`, `backend_type`, `connection_mode`, `model`, `endpoint`, `error_type` |
 
-Error types: `timeout`, `connection`, `upstream`, `internal`, `validation`
+Error types: `no_workers`, `timeout`, `backend_error`, `validation_error`, `internal_error`
 
 ```promql
 # Error rate by type
@@ -180,9 +189,9 @@ Duration of individual pipeline stages (gRPC mode only).
 
 | Type | Labels |
 |------|--------|
-| Histogram | `stage` |
+| Histogram | `router_type`, `stage` |
 
-Stages: `tokenize`, `chat_template`, `route`, `inference`, `detokenize`, `tool_parse`
+Stage names are emitted by the gRPC pipeline (e.g., `tokenize`, `route`, `inference`, `detokenize`, `tool_parse`).
 
 ```promql
 # Tokenization latency
@@ -197,7 +206,7 @@ Time to first token (gRPC streaming only).
 
 | Type | Labels |
 |------|--------|
-| Histogram | `model` |
+| Histogram | `router_type`, `backend_type`, `model`, `endpoint` |
 
 ```promql
 # P50 TTFT by model
@@ -212,7 +221,7 @@ Time per output token (gRPC streaming only).
 
 | Type | Labels |
 |------|--------|
-| Histogram | `model` |
+| Histogram | `router_type`, `backend_type`, `model`, `endpoint` |
 
 ```promql
 # Average TPOT
@@ -227,16 +236,16 @@ Token counts by type.
 
 | Type | Labels |
 |------|--------|
-| Counter | `type`, `model` |
+| Counter | `router_type`, `backend_type`, `model`, `endpoint`, `token_type` |
 
-Types: `input`, `output`
+Token types: `input`, `output`
 
 ```promql
 # Tokens per second
-sum by (type) (rate(smg_router_tokens_total[5m]))
+sum by (token_type) (rate(smg_router_tokens_total[5m]))
 
 # Input/output ratio
-sum(rate(smg_router_tokens_total{type="output"}[5m])) / sum(rate(smg_router_tokens_total{type="input"}[5m]))
+sum(rate(smg_router_tokens_total{token_type="output"}[5m])) / sum(rate(smg_router_tokens_total{token_type="input"}[5m]))
 ```
 
 ---
@@ -247,7 +256,7 @@ Total generation time (first token to last token).
 
 | Type | Labels |
 |------|--------|
-| Histogram | `model` |
+| Histogram | `router_type`, `backend_type`, `model`, `endpoint` |
 
 ---
 
@@ -257,7 +266,7 @@ HTTP responses from upstream workers.
 
 | Type | Labels |
 |------|--------|
-| Counter | `status_code` |
+| Counter | `router_type`, `status_code`, `error_code` |
 
 ---
 
@@ -271,17 +280,17 @@ Number of workers in the pool.
 
 | Type | Labels |
 |------|--------|
-| Gauge | None |
+| Gauge | `worker_type`, `connection_mode`, `model` |
 
 ---
 
 ### `smg_worker_connections_active`
 
-Active connections per worker.
+Active connections per worker pool.
 
 | Type | Labels |
 |------|--------|
-| Gauge | `worker` |
+| Gauge | `worker_type`, `connection_mode` |
 
 ---
 
@@ -324,7 +333,7 @@ Health check results.
 
 | Type | Labels |
 |------|--------|
-| Counter | `worker`, `result` |
+| Counter | `worker_type`, `result` |
 
 Results: `success`, `failure`
 
@@ -336,17 +345,17 @@ Worker selection events by load balancer.
 
 | Type | Labels |
 |------|--------|
-| Counter | `worker`, `policy` |
+| Counter | `worker_type`, `connection_mode`, `model`, `policy` |
 
 ---
 
 ### `smg_worker_errors_total`
 
-Worker errors by type.
+Worker-level errors by type.
 
 | Type | Labels |
 |------|--------|
-| Counter | `worker`, `error_type` |
+| Counter | `worker_type`, `connection_mode`, `error_type` |
 
 ---
 
@@ -409,7 +418,7 @@ Retry attempts.
 
 | Type | Labels |
 |------|--------|
-| Counter | `worker`, `attempt` |
+| Counter | `worker_type`, `endpoint` |
 
 #### `smg_worker_retries_exhausted_total`
 
@@ -417,15 +426,15 @@ Requests that exhausted all retries.
 
 | Type | Labels |
 |------|--------|
-| Counter | `worker` |
+| Counter | `worker_type`, `endpoint` |
 
 #### `smg_worker_retry_backoff_seconds`
 
-Retry backoff durations.
+Retry backoff durations by attempt number.
 
 | Type | Labels |
 |------|--------|
-| Histogram | `worker` |
+| Histogram | `attempt` |
 
 ---
 
@@ -542,7 +551,7 @@ Database operations.
 | Counter | `storage_type`, `operation`, `result` |
 
 Storage types: `response`, `conversation`, `conversation_item`
-Operations: `read`, `write`, `delete`
+Operations: `get`, `put`, `delete`, `list`
 
 ---
 
@@ -588,6 +597,46 @@ Entries in the cache-aware routing cache.
 
 ---
 
+### `smg_worker_routing_keys_active`
+
+Active routing keys per worker (used by cache-aware policies).
+
+| Type | Labels |
+|------|--------|
+| Gauge | `worker` |
+
+---
+
+### `smg_manual_policy_branch_total`
+
+Manual policy execution branch counts for routing decisions.
+
+| Type | Labels |
+|------|--------|
+| Counter | `branch` |
+
+---
+
+### `smg_consistent_hashing_policy_branch_total`
+
+Consistent hashing policy execution branch counts for routing decisions.
+
+| Type | Labels |
+|------|--------|
+| Counter | `branch` |
+
+---
+
+### `smg_prefix_hash_policy_branch_total`
+
+Prefix hash policy execution branch counts for routing decisions.
+
+| Type | Labels |
+|------|--------|
+| Counter | `branch` |
+
+---
+
 ## Dashboard Queries Summary
 
 | Metric | Query |
@@ -599,18 +648,19 @@ Entries in the cache-aware routing cache.
 | Tokens/sec | `sum(rate(smg_router_tokens_total[5m]))` |
 | Healthy workers | `sum(smg_worker_health)` |
 | Open circuits | `count(smg_worker_cb_state == 1)` |
-| Rate limit rejections | `rate(smg_http_rate_limit_total{decision="rejected"}[5m])` |
+| Rate limit rejections | `rate(smg_http_rate_limit_total{result="rejected"}[5m])` |
 | MCP tool success rate | `sum(rate(smg_mcp_tool_calls_total{result="success"}[5m])) / sum(rate(smg_mcp_tool_calls_total[5m]))` |
 
 ---
 
 ## Histogram Buckets
 
-Default histogram buckets (20 buckets from 1ms to 240s):
+Default histogram buckets (29 buckets from 1ms to 7200s) applied to every metric whose name ends with `duration_seconds`:
 
 ```
 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-10.0, 15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0
+10.0, 15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0, 300.0,
+480.0, 900.0, 1200.0, 1800.0, 2700.0, 3600.0, 5400.0, 7200.0
 ```
 
 Configure custom buckets via CLI:

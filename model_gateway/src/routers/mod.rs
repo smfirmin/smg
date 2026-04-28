@@ -23,30 +23,44 @@ use openai_protocol::{
     },
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    transcription::TranscriptionRequest,
 };
 
+use crate::middleware::TenantRequestMeta;
+
 pub mod anthropic;
+pub mod common;
 pub mod conversations;
 pub mod error;
 pub mod factory;
 pub mod gemini;
 pub mod grpc;
-pub mod header_utils;
 pub mod http;
-pub mod mcp_utils;
 pub mod mesh;
 pub mod openai;
 pub mod parse;
-pub mod persistence_utils;
 pub mod responses;
 pub mod router_manager;
+pub mod skills;
 pub mod tokenize;
-mod tool_output_context;
-pub mod worker_selection;
 
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
+
+/// Binary audio payload for `/v1/audio/transcriptions`.
+///
+/// The transcription endpoint uses multipart/form-data, so the file bytes
+/// travel alongside the JSON-like `TranscriptionRequest` rather than inside it.
+#[derive(Debug, Clone)]
+pub struct AudioFile {
+    /// Raw audio bytes (wav/mp3/m4a/etc.).
+    pub bytes: bytes::Bytes,
+    /// Original filename from the multipart part. Forwarded verbatim to the worker.
+    pub file_name: String,
+    /// Original content-type of the audio part (e.g. `audio/wav`), if the client supplied one.
+    pub content_type: Option<String>,
+}
 
 /// Core trait for all router implementations
 ///
@@ -89,6 +103,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &GenerateRequest,
         _model_id: &str,
     ) -> Response {
@@ -103,6 +118,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_chat(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &ChatCompletionRequest,
         _model_id: &str,
     ) -> Response {
@@ -117,6 +133,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_completion(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &CompletionRequest,
         _model_id: &str,
     ) -> Response {
@@ -131,6 +148,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_responses(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &ResponsesRequest,
         _model_id: &str,
     ) -> Response {
@@ -154,6 +172,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &EmbeddingRequest,
         _model_id: &str,
     ) -> Response {
@@ -164,16 +183,39 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_classify(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &ClassifyRequest,
         _model_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
     }
 
+    /// Route audio transcription requests (OpenAI-compatible /v1/audio/transcriptions).
+    ///
+    /// Unlike the JSON-bodied endpoints, `/v1/audio/transcriptions` uses
+    /// multipart/form-data: the server handler parses the form, packs text
+    /// fields into `body` and the audio part into `audio`, and routers forward
+    /// both to a worker capable of audio transcription.
+    async fn route_audio_transcriptions(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: &TranscriptionRequest,
+        _audio: AudioFile,
+        _model_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Audio transcriptions not implemented",
+        )
+            .into_response()
+    }
+
     /// Route rerank requests
     async fn route_rerank(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &RerankRequest,
         _model_id: &str,
     ) -> Response {
@@ -184,6 +226,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_messages(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &CreateMessageRequest,
         _model_id: &str,
     ) -> Response {
@@ -198,6 +241,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_interactions(
         &self,
         _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         _body: &InteractionsRequest,
         _model_id: Option<&str>,
     ) -> Response {

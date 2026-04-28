@@ -234,10 +234,16 @@ pub struct JsonSchemaFormat {
 // Streaming
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct StreamOptions {
+    /// Chat Completions / Completions: include usage block at end of stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+
+    /// Responses API: add random chars on `obfuscation` field of delta events
+    /// to normalize payload sizes. Defaults to `true` upstream when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -707,7 +713,9 @@ pub enum PromptVariableTyped {
     },
 }
 
-/// Image detail level for [`PromptVariableTyped::InputImage`].
+/// Image detail level for [`PromptVariableTyped::ResponseInputImage`] and
+/// [`crate::responses::ResponseContentPart::InputImage`]. Spec allows
+/// `"low" | "high" | "auto" | "original"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Detail {
@@ -715,6 +723,75 @@ pub enum Detail {
     High,
     #[default]
     Auto,
+    Original,
+}
+
+// ============================================================================
+// Responses API: prompt-cache retention & context management
+// ============================================================================
+
+/// Retention policy for prompt-cache entries on the Responses API.
+///
+/// Spec: `prompt_cache_retention: "in-memory" | "24h"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum PromptCacheRetention {
+    #[serde(rename = "in-memory")]
+    InMemory,
+    #[serde(rename = "24h")]
+    Duration24h,
+}
+
+/// A single entry in the Responses API `context_management` array.
+///
+/// Spec: each entry has `type` (currently only `"compaction"`) and an optional
+/// `compact_threshold` token count.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextManagementEntry {
+    #[serde(rename = "type")]
+    pub r#type: ContextManagementType,
+    pub compact_threshold: Option<u32>,
+}
+
+/// Type tag for [`ContextManagementEntry`]. Currently only `compaction` is
+/// defined by the spec; the enum is kept small so unknown values serde-fail
+/// (consistent with P5's fail-fast direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagementType {
+    Compaction,
+}
+
+// ============================================================================
+// Responses API: conversation reference
+// ============================================================================
+
+/// Reference to a conversation the response belongs to.
+///
+/// Spec: `conversation: string | ResponseConversationParam { id: string }`.
+/// Variant order matters for `#[serde(untagged)]`: a bare JSON string succeeds
+/// as `Id`; an object falls through to `Object`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ConversationRef {
+    Id(String),
+    Object { id: String },
+}
+
+impl ConversationRef {
+    /// Return the underlying conversation id regardless of the wire shape.
+    pub fn as_id(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::Object { id } => id.as_str(),
+        }
+    }
+
+    /// `true` when the underlying conversation id is the empty string.
+    /// Mirrors `String::is_empty` for callers that previously treated
+    /// `Option<String>` empty values as "unset".
+    pub fn is_empty(&self) -> bool {
+        self.as_id().is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -748,5 +825,32 @@ mod tests {
     fn test_deserialize_null_as_false_rejects_non_bool() {
         let result = serde_json::from_value::<NullableBoolTest>(json!({"field": "yes"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn conversation_ref_deserializes_bare_string() {
+        let v = json!("conv_abc");
+        let r: ConversationRef = serde_json::from_value(v).expect("string form");
+        assert!(matches!(r, ConversationRef::Id(ref s) if s == "conv_abc"));
+        assert_eq!(r.as_id(), "conv_abc");
+        // Bare string round-trips back to a JSON string.
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!("conv_abc"));
+    }
+
+    #[test]
+    fn conversation_ref_deserializes_object() {
+        let v = json!({"id": "conv_xyz"});
+        let r: ConversationRef = serde_json::from_value(v).expect("object form");
+        assert!(matches!(r, ConversationRef::Object { ref id } if id == "conv_xyz"));
+        assert_eq!(r.as_id(), "conv_xyz");
+        // Object round-trips back to an object.
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!({"id": "conv_xyz"}));
+    }
+
+    #[test]
+    fn conversation_ref_is_empty() {
+        assert!(ConversationRef::Id(String::new()).is_empty());
+        assert!(!ConversationRef::Id("conv_1".to_string()).is_empty());
+        assert!(ConversationRef::Object { id: String::new() }.is_empty());
     }
 }

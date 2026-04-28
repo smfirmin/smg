@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use futures_util::StreamExt;
 use smg_grpc_client::{
+    mlx_engine::AbortOnDropStream as MlxStream,
+    mlx_proto::{self as mlx},
     sglang_proto::{self as sglang, generate_complete::MatchedStop as SglangMatchedStop},
     sglang_scheduler::AbortOnDropStream as SglangStream,
     trtllm_proto::{self as trtllm, generate_complete::MatchedStop as TrtllmMatchedStop},
@@ -277,6 +279,7 @@ pub enum ProtoGenerateRequest {
     Sglang(Box<sglang::GenerateRequest>),
     Vllm(Box<vllm::GenerateRequest>),
     Trtllm(Box<trtllm::GenerateRequest>),
+    Mlx(Box<mlx::GenerateRequest>),
 }
 
 impl ProtoGenerateRequest {
@@ -382,7 +385,7 @@ impl ProtoGenerateRequest {
                     });
                 }
             }
-            _ => {
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {
                 tracing::warn!("set_max_tokens_for_prefill called on non-vLLM request, ignoring");
             }
         }
@@ -394,6 +397,7 @@ impl ProtoGenerateRequest {
             Self::Vllm(req) => req.stream = stream,
             Self::Sglang(req) => req.stream = stream,
             Self::Trtllm(req) => req.streaming = stream,
+            Self::Mlx(req) => req.stream = stream,
         }
     }
 
@@ -402,12 +406,26 @@ impl ProtoGenerateRequest {
         self.clone()
     }
 
+    /// Strip multimodal inputs from the request.
+    ///
+    /// Used for the decode worker in PD disaggregation — the decode worker only
+    /// needs the KV cache from prefill, not the image pixel data. This avoids
+    /// transmitting ~40MB of pixel tensors to a worker that ignores them.
+    pub fn clear_mm_inputs(&mut self) {
+        match self {
+            Self::Sglang(req) => req.mm_inputs = None,
+            Self::Vllm(req) => req.mm_inputs = None,
+            Self::Trtllm(_) | Self::Mlx(_) => {} // TRT-LLM and MLX protos have no mm_inputs field
+        }
+    }
+
     /// Get request ID
     pub fn request_id(&self) -> &str {
         match self {
             Self::Sglang(req) => &req.request_id,
             Self::Vllm(req) => &req.request_id,
             Self::Trtllm(req) => &req.request_id,
+            Self::Mlx(req) => &req.request_id,
         }
     }
 
@@ -421,7 +439,7 @@ impl ProtoGenerateRequest {
                     remote_port,
                 });
             }
-            _ => {
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {
                 tracing::warn!("set_kv_transfer_params called on non-vLLM request, ignoring");
             }
         }
@@ -433,6 +451,7 @@ pub enum ProtoGenerateResponse {
     Sglang(Box<sglang::GenerateResponse>),
     Vllm(Box<vllm::GenerateResponse>),
     Trtllm(Box<trtllm::GenerateResponse>),
+    Mlx(Box<mlx::GenerateResponse>),
 }
 
 impl ProtoGenerateResponse {
@@ -468,6 +487,15 @@ impl ProtoGenerateResponse {
                 }
                 None => ProtoResponseVariant::None,
             },
+            Self::Mlx(resp) => match resp.response {
+                Some(mlx::generate_response::Response::Chunk(chunk)) => {
+                    ProtoResponseVariant::Chunk(ProtoGenerateStreamChunk::Mlx(chunk))
+                }
+                Some(mlx::generate_response::Response::Complete(complete)) => {
+                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Mlx(complete))
+                }
+                None => ProtoResponseVariant::None,
+            },
         }
     }
 }
@@ -485,6 +513,7 @@ pub enum ProtoGenerateStreamChunk {
     Sglang(sglang::GenerateStreamChunk),
     Vllm(vllm::GenerateStreamChunk),
     Trtllm(trtllm::GenerateStreamChunk),
+    Mlx(mlx::GenerateStreamChunk),
 }
 
 impl ProtoGenerateStreamChunk {
@@ -539,12 +568,18 @@ impl ProtoGenerateStreamChunk {
         matches!(self, Self::Trtllm(_))
     }
 
+    /// Check if this is MLX
+    pub fn is_mlx(&self) -> bool {
+        matches!(self, Self::Mlx(_))
+    }
+
     /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(c) => &c.token_ids,
             Self::Vllm(c) => &c.token_ids,
             Self::Trtllm(c) => &c.token_ids,
+            Self::Mlx(c) => &c.token_ids,
         }
     }
 
@@ -555,10 +590,11 @@ impl ProtoGenerateStreamChunk {
             Self::Sglang(c) => c.index,
             Self::Vllm(c) => c.index,
             Self::Trtllm(c) => c.sequence_index,
+            Self::Mlx(c) => c.index,
         }
     }
 
-    /// Get output logprobs (SGLang, vLLM, and TensorRT-LLM)
+    /// Get output logprobs (SGLang, vLLM, TensorRT-LLM, and MLX)
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -570,6 +606,10 @@ impl ProtoGenerateStreamChunk {
                 .as_ref()
                 .map(|lp| convert_output_logprobs!(lp)),
             Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
+            Self::Mlx(c) => c
+                .output_logprobs
+                .as_ref()
+                .map(|lp| convert_output_logprobs!(lp)),
         }
     }
 
@@ -584,8 +624,8 @@ impl ProtoGenerateStreamChunk {
                 .input_logprobs
                 .as_ref()
                 .map(|lp| convert_input_logprobs!(lp)),
-            // TRT-LLM streaming chunks don't have prompt_logprobs
-            Self::Trtllm(_) => None,
+            // TRT-LLM and MLX streaming chunks don't have input_logprobs
+            Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 
@@ -595,6 +635,7 @@ impl ProtoGenerateStreamChunk {
             Self::Sglang(c) => c.prompt_tokens,
             Self::Vllm(c) => c.prompt_tokens,
             Self::Trtllm(c) => c.prompt_tokens,
+            Self::Mlx(c) => c.prompt_tokens,
         }
     }
 
@@ -604,6 +645,7 @@ impl ProtoGenerateStreamChunk {
             Self::Sglang(c) => c.completion_tokens,
             Self::Vllm(c) => c.completion_tokens,
             Self::Trtllm(c) => c.completion_tokens,
+            Self::Mlx(c) => c.completion_tokens,
         }
     }
 
@@ -613,6 +655,7 @@ impl ProtoGenerateStreamChunk {
             Self::Sglang(c) => c.cached_tokens,
             Self::Vllm(c) => c.cached_tokens,
             Self::Trtllm(c) => c.cached_tokens,
+            Self::Mlx(c) => c.cached_tokens,
         }
     }
 }
@@ -623,6 +666,7 @@ pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
     Vllm(vllm::GenerateComplete),
     Trtllm(trtllm::GenerateComplete),
+    Mlx(mlx::GenerateComplete),
 }
 
 impl ProtoGenerateComplete {
@@ -689,12 +733,18 @@ impl ProtoGenerateComplete {
         matches!(self, Self::Trtllm(_))
     }
 
+    /// Check if this is MLX
+    pub fn is_mlx(&self) -> bool {
+        matches!(self, Self::Mlx(_))
+    }
+
     /// Get token IDs from either backend (output_ids in proto)
     pub fn token_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(c) => &c.output_ids,
             Self::Vllm(c) => &c.output_ids,
             Self::Trtllm(c) => &c.output_token_ids,
+            Self::Mlx(c) => &c.output_ids,
         }
     }
 
@@ -704,6 +754,7 @@ impl ProtoGenerateComplete {
             Self::Sglang(c) => c.prompt_tokens,
             Self::Vllm(c) => c.prompt_tokens,
             Self::Trtllm(c) => c.prompt_tokens,
+            Self::Mlx(c) => c.prompt_tokens,
         }
     }
 
@@ -713,6 +764,7 @@ impl ProtoGenerateComplete {
             Self::Sglang(c) => c.completion_tokens,
             Self::Vllm(c) => c.completion_tokens,
             Self::Trtllm(c) => c.completion_tokens,
+            Self::Mlx(c) => c.completion_tokens,
         }
     }
 
@@ -722,6 +774,7 @@ impl ProtoGenerateComplete {
             Self::Sglang(c) => &c.finish_reason,
             Self::Vllm(c) => &c.finish_reason,
             Self::Trtllm(c) => &c.finish_reason,
+            Self::Mlx(c) => &c.finish_reason,
         }
     }
 
@@ -732,6 +785,7 @@ impl ProtoGenerateComplete {
             Self::Sglang(c) => c.index,
             Self::Vllm(c) => c.index,
             Self::Trtllm(c) => c.sequence_index,
+            Self::Mlx(c) => c.index,
         }
     }
 
@@ -766,6 +820,9 @@ impl ProtoGenerateComplete {
                 TrtllmMatchedStop::MatchedTokenId,
                 TrtllmMatchedStop::MatchedStopStr
             ),
+            Self::Mlx(c) => c
+                .matched_stop_token_id
+                .map(|id| serde_json::Value::Number(id.into())),
         }
     }
 
@@ -775,6 +832,7 @@ impl ProtoGenerateComplete {
             Self::Sglang(c) => &c.output_ids,
             Self::Vllm(c) => &c.output_ids,
             Self::Trtllm(c) => &c.output_token_ids,
+            Self::Mlx(c) => &c.output_ids,
         }
     }
 
@@ -784,6 +842,7 @@ impl ProtoGenerateComplete {
             Self::Sglang(c) => c.cached_tokens,
             Self::Vllm(c) => c.cached_tokens,
             Self::Trtllm(c) => c.cached_tokens,
+            Self::Mlx(c) => c.cached_tokens,
         }
     }
 
@@ -822,10 +881,12 @@ impl ProtoGenerateComplete {
                     })
                 }
             }
+            // MLX does not have input_logprobs
+            Self::Mlx(_) => None,
         }
     }
 
-    /// Get output logprobs (SGLang, vLLM, and TensorRT-LLM)
+    /// Get output logprobs (SGLang, vLLM, TensorRT-LLM, and MLX)
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -837,6 +898,10 @@ impl ProtoGenerateComplete {
                 .as_ref()
                 .map(|lp| convert_output_logprobs!(lp)),
             Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
+            Self::Mlx(c) => c
+                .output_logprobs
+                .as_ref()
+                .map(|lp| convert_output_logprobs!(lp)),
         }
     }
 
@@ -848,7 +913,7 @@ impl ProtoGenerateComplete {
                 .kv_transfer_params
                 .as_ref()
                 .map(|params| (params.remote_host.clone(), params.remote_port)),
-            Self::Sglang(_) | Self::Trtllm(_) => None,
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 }
@@ -858,6 +923,7 @@ pub enum ProtoStream {
     Sglang(SglangStream),
     Vllm(VllmStream),
     Trtllm(TrtllmStream),
+    Mlx(MlxStream),
 }
 
 impl ProtoStream {
@@ -876,6 +942,10 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Trtllm(Box::new(r)))),
+            Self::Mlx(stream) => stream
+                .next()
+                .await
+                .map(|result| result.map(|r| ProtoGenerateResponse::Mlx(Box::new(r)))),
         }
     }
 
@@ -885,6 +955,7 @@ impl ProtoStream {
             Self::Sglang(stream) => stream.mark_completed(),
             Self::Vllm(stream) => stream.mark_completed(),
             Self::Trtllm(stream) => stream.mark_completed(),
+            Self::Mlx(stream) => stream.mark_completed(),
         }
     }
 }

@@ -11,12 +11,14 @@ mod common;
 
 use std::collections::HashMap;
 
-use common::mock_mcp_server::MockMCPServer;
-use openai_protocol::responses::ResponseOutputItem;
+use common::mock_mcp_server::{MockMCPServer, MockSearchResponseMCPServer, MockSearchResponseMode};
+use openai_protocol::responses::{ResponseOutputItem, WebSearchAction};
 use serde_json::json;
 use smg_mcp::{
-    error::McpError, ApprovalMode, McpConfig, McpOrchestrator, McpServerConfig, McpTransport,
-    TenantContext, ToolCallResult,
+    core::config::{ResponseFormatConfig, ToolConfig},
+    error::McpError,
+    ApprovalMode, McpConfig, McpOrchestrator, McpServerConfig, McpTransport, TenantContext,
+    ToolCallResult,
 };
 
 /// Create a new mock server for testing (each test gets its own)
@@ -25,6 +27,15 @@ async fn create_mock_server() -> MockMCPServer {
     MockMCPServer::start()
         .await
         .expect("Failed to start mock MCP server")
+}
+
+#[expect(clippy::expect_used)]
+async fn create_mock_search_response_server(
+    mode: MockSearchResponseMode,
+) -> MockSearchResponseMCPServer {
+    MockSearchResponseMCPServer::start(mode)
+        .await
+        .expect("Failed to start mock search response MCP server")
 }
 
 // Core MCP Server Tests
@@ -68,6 +79,7 @@ async fn test_server_connection_with_mock() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -111,6 +123,7 @@ async fn test_tool_availability_checking() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -163,6 +176,7 @@ async fn test_multi_server_connection() {
                 tools: None,
                 builtin_type: None,
                 builtin_tool_name: None,
+                internal: false,
             },
             McpServerConfig {
                 name: "mock_server_2".to_string(),
@@ -176,6 +190,7 @@ async fn test_multi_server_connection() {
                 tools: None,
                 builtin_type: None,
                 builtin_tool_name: None,
+                internal: false,
             },
         ],
         pool: Default::default(),
@@ -217,6 +232,7 @@ async fn test_tool_execution_with_mock() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -273,6 +289,158 @@ async fn test_tool_execution_with_mock() {
 }
 
 #[tokio::test]
+async fn test_web_search_transform_handles_openai_search_response_with_mock() {
+    let mock_server = create_mock_search_response_server(MockSearchResponseMode::OpenAi).await;
+    let mut tools = HashMap::new();
+    tools.insert(
+        "brave_web_search".to_string(),
+        ToolConfig {
+            alias: None,
+            response_format: ResponseFormatConfig::WebSearchCall,
+            arg_mapping: None,
+        },
+    );
+
+    let config = McpConfig {
+        servers: vec![McpServerConfig {
+            name: "openai_search_server".to_string(),
+            transport: McpTransport::Streamable {
+                url: mock_server.url(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            proxy: None,
+            required: false,
+            tools: Some(tools),
+            builtin_type: None,
+            builtin_tool_name: None,
+            internal: false,
+        }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
+        policy: Default::default(),
+    };
+
+    let manager = McpOrchestrator::new(config).await.unwrap();
+
+    let request_ctx = manager.create_request_context(
+        "test-request-openai-search",
+        TenantContext::default(),
+        ApprovalMode::PolicyOnly,
+    );
+
+    let result = manager
+        .call_tool(
+            "openai_search_server",
+            "brave_web_search",
+            json!({
+                "query": "rust openai search"
+            }),
+            "openai_search_server",
+            &request_ctx,
+        )
+        .await;
+
+    assert!(result.is_ok(), "Tool execution should succeed");
+
+    match result.unwrap() {
+        ToolCallResult::Success(ResponseOutputItem::WebSearchCall { action, .. }) => match action {
+            WebSearchAction::Search {
+                query,
+                queries: _,
+                sources,
+            } => {
+                assert_eq!(query, Some("rust openai search".to_string()));
+                assert_eq!(sources.len(), 1);
+                assert_eq!(sources[0].source_type, "url");
+                assert_eq!(sources[0].url, "https://example.com/openai-result");
+            }
+            _ => panic!("Expected Search action"),
+        },
+        ToolCallResult::Success(other) => panic!("Expected WebSearchCall, got {other:?}"),
+        ToolCallResult::PendingApproval(_) => panic!("Expected Success result"),
+    }
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_web_search_transform_sets_action_query_for_brave_search_with_mock() {
+    let mock_server = create_mock_search_response_server(MockSearchResponseMode::Brave).await;
+    let mut tools = HashMap::new();
+    tools.insert(
+        "brave_web_search".to_string(),
+        ToolConfig {
+            alias: None,
+            response_format: ResponseFormatConfig::WebSearchCall,
+            arg_mapping: None,
+        },
+    );
+
+    let config = McpConfig {
+        servers: vec![McpServerConfig {
+            name: "brave_response_server".to_string(),
+            transport: McpTransport::Streamable {
+                url: mock_server.url(),
+                token: None,
+                headers: HashMap::new(),
+            },
+            proxy: None,
+            required: false,
+            tools: Some(tools),
+            builtin_type: None,
+            builtin_tool_name: None,
+            internal: false,
+        }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
+        policy: Default::default(),
+    };
+
+    let manager = McpOrchestrator::new(config).await.unwrap();
+
+    let request_ctx = manager.create_request_context(
+        "test-request-brave",
+        TenantContext::default(),
+        ApprovalMode::PolicyOnly,
+    );
+
+    let result = manager
+        .call_tool(
+            "brave_response_server",
+            "brave_web_search",
+            json!({
+                "query": "rust brave query"
+            }),
+            "brave_response_server",
+            &request_ctx,
+        )
+        .await;
+
+    assert!(result.is_ok(), "Tool execution should succeed");
+
+    match result.unwrap() {
+        ToolCallResult::Success(ResponseOutputItem::WebSearchCall { action, .. }) => match action {
+            WebSearchAction::Search {
+                query,
+                queries: _,
+                sources: _,
+            } => {
+                assert_eq!(query, Some("rust brave query".to_string()));
+            }
+            _ => panic!("Expected Search action"),
+        },
+        ToolCallResult::Success(other) => panic!("Expected WebSearchCall, got {other:?}"),
+        ToolCallResult::PendingApproval(_) => panic!("Expected Success result"),
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_concurrent_tool_execution() {
     let mock_server = create_mock_server().await;
 
@@ -289,6 +457,7 @@ async fn test_concurrent_tool_execution() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -355,6 +524,7 @@ async fn test_tool_execution_errors() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -409,6 +579,7 @@ async fn test_connection_without_server() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -448,6 +619,7 @@ async fn test_tool_info_structure() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -494,6 +666,7 @@ async fn test_sse_connection() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,
@@ -531,6 +704,7 @@ async fn test_transport_types() {
         tools: None,
         builtin_type: None,
         builtin_tool_name: None,
+        internal: false,
     };
     assert_eq!(http_config.name, "http_server");
 
@@ -547,6 +721,7 @@ async fn test_transport_types() {
         tools: None,
         builtin_type: None,
         builtin_tool_name: None,
+        internal: false,
     };
     assert_eq!(sse_config.name, "sse_server");
 
@@ -563,6 +738,7 @@ async fn test_transport_types() {
         tools: None,
         builtin_type: None,
         builtin_tool_name: None,
+        internal: false,
     };
     assert_eq!(stdio_config.name, "stdio_server");
 }
@@ -587,6 +763,7 @@ async fn test_complete_workflow() {
             tools: None,
             builtin_type: None,
             builtin_tool_name: None,
+            internal: false,
         }],
         pool: Default::default(),
         proxy: None,

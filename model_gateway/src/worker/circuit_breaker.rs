@@ -8,7 +8,7 @@ use tracing::info;
 use crate::observability::metrics::Metrics;
 
 /// Circuit breaker configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircuitBreakerConfig {
     /// Number of consecutive failures to open the circuit
     pub failure_threshold: u32,
@@ -143,6 +143,11 @@ impl CircuitBreaker {
         &self.metric_label
     }
 
+    /// Get the configuration used to create this circuit breaker.
+    pub fn config(&self) -> &CircuitBreakerConfig {
+        &self.config
+    }
+
     /// Check if a request can be executed (lock-free hot path)
     #[inline]
     pub fn can_execute(&self) -> bool {
@@ -240,7 +245,6 @@ impl CircuitBreaker {
         self.consecutive_successes.store(0, Ordering::Release);
         let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Update last failure time atomically
         self.last_failure_time_ms.store(now_ms(), Ordering::Release);
 
         let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));

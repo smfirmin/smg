@@ -263,7 +263,12 @@ impl fmt::Display for FileSearchCallEvent {
     }
 }
 
-/// Image generation call events for streaming
+/// Image generation call events for streaming.
+///
+/// Mirrors OpenAI Python SDK 2.8.1 `response_image_gen_call_*_event.py` and
+/// `.claude/_audit/openai-responses-api-spec.md` §tools (image_generation).
+/// `PartialImage` is emitted 0-3 times per call when the tool is configured
+/// with `partial_images`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageGenerationCallEvent {
     InProgress,

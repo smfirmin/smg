@@ -310,6 +310,18 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     storage_context_headers: Vec<String>,
 
+    /// Trust an upstream-provided tenant header for canonical tenant resolution.
+    #[arg(long, default_value_t = false, help_heading = "Request Handling")]
+    trust_tenant_header: bool,
+
+    /// Header name to use when --trust-tenant-header is enabled.
+    #[arg(
+        long,
+        default_value = "x-smg-tenant-id",
+        help_heading = "Request Handling"
+    )]
+    tenant_header_name: String,
+
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
@@ -463,6 +475,21 @@ struct CliArgs {
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
     mcp_config_path: Option<String>,
+
+    // ==================== Skills ====================
+    /// Enable the skills subsystem scaffolding.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool),
+        help_heading = "Skills"
+    )]
+    skills_enabled: Option<bool>,
+
+    /// Path to a YAML file with the nested skills configuration.
+    #[arg(long, help_heading = "Skills")]
+    skills_config_path: Option<String>,
 
     // ==================== Backend ====================
     /// Backend runtime to use (auto-detected if not specified)
@@ -1157,6 +1184,10 @@ impl CliArgs {
             _ => (None, None, None),
         };
 
+        let skills_enabled = self
+            .skills_enabled
+            .unwrap_or_else(|| self.skills_config_path.is_some());
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1215,6 +1246,8 @@ impl CliArgs {
                 (!self.storage_context_headers.is_empty())
                     .then(|| Self::parse_selector(&self.storage_context_headers)),
             )
+            .trust_tenant_header(self.trust_tenant_header)
+            .tenant_header_name(&self.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
@@ -1225,6 +1258,8 @@ impl CliArgs {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .skills_enabled(skills_enabled)
+            .maybe_skills_config_path(self.skills_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -1418,7 +1453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_config = cli_args.to_server_config(router_config)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move { server::startup(server_config).await })?;
+    runtime.block_on(Box::pin(server::startup(server_config)))?;
     if is_otel_enabled() {
         shutdown_otel();
     }
