@@ -7,8 +7,8 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
+    extract::{multipart::MultipartError, Extension, Multipart, Path, Query, Request, State},
+    http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -29,7 +29,12 @@ use openai_protocol::{
     },
     rerank::{RerankRequest, V1RerankReqInput},
     responses::ResponsesRequest,
+    skills::{
+        SkillGetQuery, SkillPatchRequest, SkillVersionPatchRequest, SkillVersionsListQuery,
+        SkillsListQuery,
+    },
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
+    transcription::TranscriptionRequest,
     validated::ValidatedJson,
     worker::{WorkerSpec, WorkerUpdateRequest},
 };
@@ -62,11 +67,14 @@ use crate::{
         openai::realtime::ws::RealtimeQueryParams,
         parse, responses as response_handlers,
         router_manager::RouterManager,
-        tokenize, RouterTrait,
+        skills, tokenize, AudioFile, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    worker::{manager::WorkerManager, worker::WorkerType},
+    worker::{
+        manager::{WorkerManager, WorkerManagerConfig},
+        worker::WorkerType,
+    },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
         Job, TokenizerConfigRequest, WorkflowEngines,
@@ -177,114 +185,274 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 async fn generate(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
     state
         .router
-        .route_generate(Some(&headers), &body, &body.model)
+        .route_generate(Some(&headers), &tenant_meta, &body, &body.model)
         .await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     state
         .router
-        .route_chat(Some(&headers), &body, &body.model)
+        .route_chat(Some(&headers), &tenant_meta, &body, &body.model)
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, &body.model)
+        .route_completion(Some(&headers), &tenant_meta, &body, &body.model)
         .await
 }
 
 async fn rerank(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
     state
         .router
-        .route_rerank(Some(&headers), &body, &body.model)
+        .route_rerank(Some(&headers), &tenant_meta, &body, &body.model)
         .await
 }
 
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
     state
         .router
-        .route_rerank(Some(&headers), &rerank_body, &rerank_body.model)
+        .route_rerank(
+            Some(&headers),
+            &tenant_meta,
+            &rerank_body,
+            &rerank_body.model,
+        )
         .await
 }
 
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
     state
         .router
-        .route_responses(Some(&headers), &body, &body.model)
+        .route_responses(Some(&headers), &tenant_meta, &body, &body.model)
         .await
 }
 
 async fn v1_interactions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<InteractionsRequest>,
 ) -> Response {
     let model_id = body.model.as_deref().or(body.agent.as_deref());
     state
         .router
-        .route_interactions(Some(&headers), &body, model_id)
+        .route_interactions(Some(&headers), &tenant_meta, &body, model_id)
         .await
 }
 
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
     state
         .router
-        .route_embeddings(Some(&headers), &body, &body.model)
+        .route_embeddings(Some(&headers), &tenant_meta, &body, &body.model)
         .await
 }
 
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
     state
         .router
-        .route_messages(Some(&headers), &body, &body.model)
+        .route_messages(Some(&headers), &tenant_meta, &body, &body.model)
         .await
 }
 
 async fn v1_classify(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Json(body): Json<ClassifyRequest>,
 ) -> Response {
     state
         .router
-        .route_classify(Some(&headers), &body, &body.model)
+        .route_classify(Some(&headers), &tenant_meta, &body, &body.model)
         .await
+}
+
+async fn v1_audio_transcriptions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    mut multipart: Multipart,
+) -> Response {
+    let mut file_bytes: Option<bytes::Bytes> = None;
+    let mut file_name: Option<String> = None;
+    let mut file_content_type: Option<String> = None;
+    let mut req = TranscriptionRequest::default();
+    let mut timestamp_granularities: Vec<String> = Vec::new();
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read multipart field: {e}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                file_name = field.file_name().map(str::to_string);
+                file_content_type = field.content_type().map(str::to_string);
+                match field.bytes().await {
+                    Ok(b) => file_bytes = Some(b),
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to read audio file bytes: {e}"),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            "model" => match field.text().await {
+                Ok(t) => req.model = t,
+                Err(e) => return bad_text_field("model", e),
+            },
+            "language" => match field.text().await {
+                Ok(t) => req.language = Some(t),
+                Err(e) => return bad_text_field("language", e),
+            },
+            "prompt" => match field.text().await {
+                Ok(t) => req.prompt = Some(t),
+                Err(e) => return bad_text_field("prompt", e),
+            },
+            "response_format" => match field.text().await {
+                Ok(t) => req.response_format = Some(t),
+                Err(e) => return bad_text_field("response_format", e),
+            },
+            "temperature" => match field.text().await {
+                Ok(t) => match t.trim().parse::<f32>() {
+                    Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => {
+                        req.temperature = Some(v);
+                    }
+                    Ok(v) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "Invalid 'temperature' value: {v} (must be a finite number in [0.0, 1.0])"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("Invalid 'temperature' value: {e}"),
+                        )
+                            .into_response();
+                    }
+                },
+                Err(e) => return bad_text_field("temperature", e),
+            },
+            "timestamp_granularities" | "timestamp_granularities[]" => match field.text().await {
+                Ok(t) => timestamp_granularities.push(t),
+                Err(e) => return bad_text_field("timestamp_granularities", e),
+            },
+            "stream" => match field.text().await {
+                Ok(t) => match t.as_str() {
+                    "true" | "True" | "TRUE" | "1" => req.stream = Some(true),
+                    "false" | "False" | "FALSE" | "0" => req.stream = Some(false),
+                    other => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("Invalid 'stream' value: '{other}' (expected true/false/1/0)"),
+                        )
+                            .into_response();
+                    }
+                },
+                Err(e) => return bad_text_field("stream", e),
+            },
+            _ => {
+                // Unknown field; drain to free resources but otherwise ignore.
+                let _ = field.bytes().await;
+            }
+        }
+    }
+
+    // Reject blank/whitespace-only `model` before it reaches worker selection.
+    if req.model.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing required 'model' field").into_response();
+    }
+    req.model = req.model.trim().to_string();
+    let bytes = match file_bytes {
+        Some(b) if !b.is_empty() => b,
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, "Uploaded 'file' part is empty").into_response();
+        }
+        None => {
+            return (StatusCode::BAD_REQUEST, "Missing required 'file' part").into_response();
+        }
+    };
+
+    if !timestamp_granularities.is_empty() {
+        req.timestamp_granularities = Some(timestamp_granularities);
+    }
+
+    let audio = AudioFile {
+        bytes,
+        file_name: file_name.unwrap_or_else(|| "audio".to_string()),
+        content_type: file_content_type,
+    };
+
+    state
+        .router
+        .route_audio_transcriptions(Some(&headers), &tenant_meta, &req, audio, &req.model)
+        .await
+}
+
+fn bad_text_field(field: &str, e: MultipartError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("Failed to read '{field}' field: {e}"),
+    )
+        .into_response()
 }
 
 async fn v1_responses_get(
@@ -297,7 +465,7 @@ async fn v1_responses_get(
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
     state
         .router
@@ -386,13 +554,18 @@ struct GetItemQuery {
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    conversations::create_conversation_items(
+    let memory_execution_context =
+        middleware::build_memory_execution_context(&state.context.router_config, &headers);
+
+    conversations::create_conversation_items_with_headers(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
         &conversation_id,
         body,
+        memory_execution_context,
     )
     .await
 }
@@ -456,7 +629,7 @@ async fn v1_realtime_ws(
 
 async fn v1_realtime_session(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RealtimeSessionCreateRequest>,
 ) -> Response {
     state
@@ -467,7 +640,7 @@ async fn v1_realtime_session(
 
 async fn v1_realtime_client_secret(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RealtimeClientSecretCreateRequest>,
 ) -> Response {
     state
@@ -478,7 +651,7 @@ async fn v1_realtime_client_secret(
 
 async fn v1_realtime_transcription_session(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RealtimeTranscriptionSessionCreateRequest>,
 ) -> Response {
     state
@@ -620,6 +793,87 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+async fn v1_skills_create(State(state): State<Arc<AppState>>, multipart: Multipart) -> Response {
+    skills::create_skill(State(state), multipart).await
+}
+
+async fn v1_skills_list(
+    State(state): State<Arc<AppState>>,
+    query: Query<SkillsListQuery>,
+    headers: HeaderMap,
+) -> Response {
+    skills::list_skills(State(state), query, headers).await
+}
+
+async fn v1_skills_get(
+    State(state): State<Arc<AppState>>,
+    Path(skill_id): Path<String>,
+    query: Query<SkillGetQuery>,
+    headers: HeaderMap,
+) -> Response {
+    skills::get_skill(State(state), Path(skill_id), query, headers).await
+}
+
+async fn v1_skills_patch(
+    State(state): State<Arc<AppState>>,
+    Path(skill_id): Path<String>,
+    query: Query<SkillGetQuery>,
+    ValidatedJson(body): ValidatedJson<SkillPatchRequest>,
+) -> Response {
+    skills::patch_skill(State(state), Path(skill_id), query, Json(body)).await
+}
+
+async fn v1_skills_create_version(
+    State(state): State<Arc<AppState>>,
+    Path(skill_id): Path<String>,
+    multipart: Multipart,
+) -> Response {
+    skills::create_skill_version(State(state), Path(skill_id), multipart).await
+}
+
+async fn v1_skills_list_versions(
+    State(state): State<Arc<AppState>>,
+    Path(skill_id): Path<String>,
+    query: Query<SkillVersionsListQuery>,
+    headers: HeaderMap,
+) -> Response {
+    skills::list_skill_versions(State(state), Path(skill_id), query, headers).await
+}
+
+async fn v1_skills_get_version(
+    State(state): State<Arc<AppState>>,
+    Path((skill_id, version)): Path<(String, String)>,
+    query: Query<SkillGetQuery>,
+    headers: HeaderMap,
+) -> Response {
+    skills::get_skill_version(State(state), Path((skill_id, version)), query, headers).await
+}
+
+async fn v1_skills_patch_version(
+    State(state): State<Arc<AppState>>,
+    Path((skill_id, version)): Path<(String, String)>,
+    query: Query<SkillGetQuery>,
+    ValidatedJson(body): ValidatedJson<SkillVersionPatchRequest>,
+) -> Response {
+    skills::patch_skill_version(State(state), Path((skill_id, version)), query, Json(body)).await
+}
+
+async fn v1_skills_delete(
+    State(state): State<Arc<AppState>>,
+    Path(skill_id): Path<String>,
+    query: Query<SkillGetQuery>,
+) -> Response {
+    skills::delete_skill(State(state), Path(skill_id), query).await
+}
+
+async fn v1_skills_delete_version(
+    State(state): State<Arc<AppState>>,
+    Path((skill_id, version)): Path<(String, String)>,
+    query: Query<SkillGetQuery>,
+) -> Response {
+    skills::delete_skill_version(State(state), Path((skill_id, version)), query).await
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -651,7 +905,7 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
-) -> Router {
+) -> Result<Router, InvalidHeaderName> {
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -659,6 +913,16 @@ pub fn build_app(
         Duration::from_secs(30),
         Duration::from_secs(60),
     );
+
+    let tenant_resolution_state =
+        middleware::TenantResolutionState::new(&app_state.context.router_config)?
+            .with_tenant_alias_store(
+                app_state
+                    .context
+                    .skill_service
+                    .as_ref()
+                    .and_then(|skill_service| skill_service.tenant_alias_store()),
+            );
 
     let protected_routes = Router::new()
         .route("/v1/responses", post(v1_responses))
@@ -718,6 +982,10 @@ pub fn build_app(
             middleware::concurrency_limit_middleware,
         ))
         .route_layer(axum::middleware::from_fn_with_state(
+            tenant_resolution_state.clone(),
+            middleware::route_request_meta_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
         ))
@@ -737,6 +1005,30 @@ pub fn build_app(
             middleware::concurrency_limit_middleware,
         ))
         .route_layer(axum::middleware::from_fn_with_state(
+            tenant_resolution_state.clone(),
+            middleware::route_request_meta_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+
+    // Multipart upload routes: auth + concurrency but NO WASM middleware.
+    // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
+    // to the WASM manager's `max_body_size` (10MB default). Audio uploads
+    // routinely exceed that, so WASM middleware would reject them with 400
+    // before reaching the handler.
+    let multipart_upload_routes = Router::new()
+        .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            tenant_resolution_state,
+            middleware::route_request_meta_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
         ));
@@ -752,7 +1044,7 @@ pub fn build_app(
         .route("/get_server_info", get(get_server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
-    let admin_routes = Router::new()
+    let mut admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
@@ -773,6 +1065,35 @@ pub fn build_app(
             "/v1/tokenizers/{tokenizer_id}/status",
             get(v1_tokenizers_status),
         );
+
+    if app_state.context.router_config.skills_enabled
+        && app_state
+            .context
+            .router_config
+            .skills
+            .as_ref()
+            .is_some_and(|skills_config| skills_config.admin.enabled)
+        && app_state.context.skill_service.is_some()
+    {
+        admin_routes = admin_routes
+            .route("/v1/skills", post(v1_skills_create).get(v1_skills_list))
+            .route(
+                "/v1/skills/{skill_id}",
+                get(v1_skills_get)
+                    .patch(v1_skills_patch)
+                    .delete(v1_skills_delete),
+            )
+            .route(
+                "/v1/skills/{skill_id}/versions",
+                post(v1_skills_create_version).get(v1_skills_list_versions),
+            )
+            .route(
+                "/v1/skills/{skill_id}/versions/{version}",
+                get(v1_skills_get_version)
+                    .patch(v1_skills_patch_version)
+                    .delete(v1_skills_delete_version),
+            );
+    }
 
     // Build worker routes
     let worker_routes = Router::new()
@@ -821,9 +1142,10 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
-    Router::new()
+    Ok(Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
+        .merge(multipart_upload_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
@@ -839,7 +1161,7 @@ pub fn build_app(
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
-        .with_state(app_state)
+        .with_state(app_state))
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1075,29 +1397,36 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
 
-    // Health checker handle must outlive the server to keep the background task alive.
-    // HealthChecker aborts its task on Drop, so binding it here keeps it alive until
-    // the server shuts down.
-    let _health_checker = if config.router_config.health_check.disable_health_check {
-        info!("Global health checks disabled via CLI/config; skipping health checker");
+    // WorkerManager owns the background health check loop. Its handle must
+    // outlive the server to keep the task alive — bind it here so its Drop
+    // (which aborts the task) runs at server shutdown.
+    let _worker_manager = if config.router_config.health_check.disable_health_check {
+        info!("Global health checks disabled via CLI/config; skipping WorkerManager");
         None
     } else {
-        let hc = app_context.worker_registry.start_health_checker(
-            config.router_config.health_check.check_interval_secs,
-            config.router_config.health_check.remove_unhealthy_workers,
+        let manager = WorkerManager::start(
+            app_context.worker_registry.clone(),
+            WorkerManagerConfig {
+                default_check_interval_secs: config.router_config.health_check.check_interval_secs,
+                remove_unhealthy: config.router_config.health_check.remove_unhealthy_workers,
+            },
             app_context.worker_job_queue.get().cloned(),
         );
         debug!(
-            "Started health checker for workers with {}s interval",
+            "Started WorkerManager health check loop with {}s default interval",
             config.router_config.health_check.check_interval_secs
         );
-        Some(hc)
+        Some(manager)
     };
 
-    // LoadMonitor groups are started dynamically when workers are registered.
-    // No explicit start() needed — see RegisterWorkersStep.
-    if app_context.load_monitor.is_some() {
-        debug!("LoadMonitor initialized (groups start on worker registration)");
+    // WorkerMonitor subscribes to registry events. Starting its event
+    // loop here (after the synchronous worker population in
+    // RouterManager::from_config above) means the bootstrap reconcile
+    // captures every worker that exists at this point and the event
+    // task picks up everything registered afterwards.
+    if let Some(ref worker_monitor) = app_context.worker_monitor {
+        worker_monitor.start_event_loop();
+        debug!("Started WorkerMonitor event loop");
     }
 
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
@@ -1230,7 +1559,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
-    );
+    )?;
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);
@@ -1293,12 +1622,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
         axum_server::bind(addr)
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     };
 
@@ -1366,7 +1695,13 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 
         tower_http::cors::CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods([http::Method::GET, http::Method::POST, http::Method::OPTIONS])
+            .allow_methods([
+                http::Method::GET,
+                http::Method::POST,
+                http::Method::PATCH,
+                http::Method::DELETE,
+                http::Method::OPTIONS,
+            ])
             .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
             .expose_headers([http::header::HeaderName::from_static("x-request-id")])
     };

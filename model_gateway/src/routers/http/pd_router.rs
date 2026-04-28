@@ -26,6 +26,7 @@ use tracing::{debug, error, warn};
 use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
+    middleware::TenantRequestMeta,
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -33,14 +34,15 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
+        common::{
+            header_utils,
+            retry::{is_retryable_status, RetryExecutor},
+        },
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        RouterTrait,
     },
-    worker::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
-    },
+    worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
 #[derive(Debug)]
@@ -765,7 +767,7 @@ impl PDRouter {
                 .collect();
             if by_model.is_empty() && is_unknown_model {
                 // "auto" means pick any — fall back to all prefill workers
-                self.worker_registry.get_prefill_workers()
+                self.worker_registry.get_prefill_workers().to_vec()
             } else {
                 by_model
             }
@@ -781,7 +783,7 @@ impl PDRouter {
                 .collect();
             if by_model.is_empty() && is_unknown_model {
                 // Only fall back to all workers when model is "unknown" (wildcard)
-                self.worker_registry.get_decode_workers()
+                self.worker_registry.get_decode_workers().to_vec()
             } else {
                 by_model
             }
@@ -1276,6 +1278,7 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &GenerateRequest,
         model_id: &str,
     ) -> Response {
@@ -1306,6 +1309,7 @@ impl RouterTrait for PDRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -1348,6 +1352,7 @@ impl RouterTrait for PDRouter {
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &CompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -1382,6 +1387,7 @@ impl RouterTrait for PDRouter {
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &RerankRequest,
         model_id: &str,
     ) -> Response {
@@ -1435,7 +1441,12 @@ mod tests {
         let worker = BasicWorkerBuilder::new(url)
             .worker_type(worker_type)
             .build();
-        worker.set_healthy(healthy);
+        let status = if healthy {
+            openai_protocol::worker::WorkerStatus::Ready
+        } else {
+            openai_protocol::worker::WorkerStatus::NotReady
+        };
+        worker.set_status(status);
         Box::new(worker)
     }
 

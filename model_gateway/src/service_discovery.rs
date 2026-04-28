@@ -640,6 +640,7 @@ async fn handle_pod_event(
             );
             let job = Job::RemoveWorker {
                 url: old_url.clone(),
+                expected_revision: None,
             };
             if let Some(job_queue) = app_context.worker_job_queue.get() {
                 if let Err(e) = job_queue.submit(job).await {
@@ -789,6 +790,7 @@ async fn handle_pod_deletion(
 
         let job = Job::RemoveWorker {
             url: worker_url.clone(),
+            expected_revision: None,
         };
 
         if let Some(job_queue) = app_context.worker_job_queue.get() {
@@ -930,6 +932,7 @@ async fn reconcile_pods(
         );
         let job = Job::RemoveWorker {
             url: worker_url.clone(),
+            expected_revision: None,
         };
         if let Some(job_queue) = app_context.worker_job_queue.get() {
             match job_queue.submit(job).await {
@@ -1152,6 +1155,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::routers::grpc::multimodal::MultimodalConfigRegistry;
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -1264,13 +1268,19 @@ mod tests {
             conversation_item_storage: Arc::new(
                 smg_data_connector::MemoryConversationItemStorage::new(),
             ),
-            load_monitor: None,
+            conversation_memory_writer: Arc::new(
+                smg_data_connector::NoOpConversationMemoryWriter::new(),
+            ),
+            background_repository: None,
+            worker_monitor: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
             worker_job_queue: worker_job_queue.clone(),
             workflow_engines: Arc::new(std::sync::OnceLock::new()),
             mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
+            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+            skill_service: None,
             wasm_manager: None,
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,

@@ -19,8 +19,13 @@
 //! );
 //! ```
 
+mod overrides;
 mod transformer;
 mod types;
 
-pub use transformer::{mcp_response_item_id, ResponseTransformer};
+pub use overrides::{apply_hosted_tool_overrides, extract_hosted_tool_overrides};
+pub use transformer::{
+    compact_image_generation_output, extract_embedded_openai_responses, mcp_response_item_id,
+    ResponseTransformer,
+};
 pub use types::ResponseFormat;

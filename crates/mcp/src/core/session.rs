@@ -9,10 +9,16 @@
 use std::collections::{HashMap, HashSet};
 
 use futures::stream::{self, StreamExt};
-use openai_protocol::responses::ResponseTool;
+use openai_protocol::responses::{
+    McpAllowedTools, RequireApproval, RequireApprovalMode, ResponseTool,
+};
 
 use super::{
-    orchestrator::{McpOrchestrator, McpRequestContext, ToolExecutionInput, ToolExecutionOutput},
+    config::BuiltinToolType,
+    orchestrator::{
+        McpOrchestrator, McpRequestContext, ToolExecutionInput, ToolExecutionOutput,
+        ToolExecutionResult,
+    },
     UNKNOWN_SERVER_KEY,
 };
 use crate::{
@@ -48,10 +54,18 @@ pub struct McpServerBinding {
 
 #[derive(Debug, Clone)]
 struct ExposedToolBinding {
+    // INVARIANT:
+    // - server_key: execution/runtime key used to invoke the tool.
+    // - associated_server_key: classification/authorization key for alias mapping and privacy checks.
+    // For alias entries these intentionally diverge. Privacy/classification logic MUST use
+    // associated_server_key and MUST NOT reuse server_key.
     server_key: String,
+    associated_server_key: String,
     server_label: String,
     resolved_tool_name: String,
+    is_builtin_routed: bool,
     response_format: ResponseFormat,
+    approval_mode: ApprovalMode,
 }
 
 /// Bundles all MCP execution state for a single request.
@@ -62,7 +76,9 @@ struct ExposedToolBinding {
 /// and `mcp_tools`.
 pub struct McpToolSession<'a> {
     orchestrator: &'a McpOrchestrator,
-    request_ctx: McpRequestContext<'a>,
+    request_id: String,
+    tenant_ctx: TenantContext,
+    forwarded_headers: HashMap<String, String>,
     /// All MCP servers in this session (including builtin).
     all_mcp_servers: Vec<McpServerBinding>,
     /// Non-builtin MCP servers only — used for `mcp_list_tools` output.
@@ -70,6 +86,12 @@ pub struct McpToolSession<'a> {
     mcp_tools: Vec<ToolEntry>,
     exposed_name_map: HashMap<String, ExposedToolBinding>,
     exposed_name_by_qualified: HashMap<QualifiedToolName, String>,
+    /// Internal server keys for this request snapshot.
+    internal_server_keys: HashSet<String>,
+    /// Builtin-routed server keys for this request snapshot.
+    builtin_server_keys: HashSet<String>,
+    /// Internal, non-builtin server labels for this request snapshot.
+    internal_non_builtin_server_labels: HashSet<String>,
 }
 
 impl<'a> McpToolSession<'a> {
@@ -82,11 +104,19 @@ impl<'a> McpToolSession<'a> {
         mcp_servers: Vec<McpServerBinding>,
         request_id: impl Into<String>,
     ) -> Self {
-        let request_ctx = orchestrator.create_request_context(
-            request_id,
-            TenantContext::default(),
-            ApprovalMode::PolicyOnly,
-        );
+        Self::new_with_headers(orchestrator, mcp_servers, request_id, HashMap::new())
+    }
+
+    /// Create a new session with forwarded request headers preserved in the
+    /// request context for downstream execution paths.
+    pub fn new_with_headers(
+        orchestrator: &'a McpOrchestrator,
+        mcp_servers: Vec<McpServerBinding>,
+        request_id: impl Into<String>,
+        forwarded_headers: HashMap<String, String>,
+    ) -> Self {
+        let request_id = request_id.into();
+        let tenant_ctx = TenantContext::default();
         let server_keys: Vec<String> = mcp_servers.iter().map(|b| b.server_key.clone()).collect();
         let mut mcp_tools = Self::collect_visible_mcp_tools(orchestrator, &server_keys);
 
@@ -113,25 +143,59 @@ impl<'a> McpToolSession<'a> {
                 }
             });
         }
+        let builtin_tool_bindings = Self::builtin_tool_bindings(orchestrator);
         let (exposed_name_map, exposed_name_by_qualified) =
-            Self::build_exposed_function_tools(&mcp_tools, &mcp_servers);
-
+            Self::build_exposed_function_tools(&mcp_tools, &mcp_servers, &builtin_tool_bindings);
+        let configured_internal_servers = orchestrator.internal_server_names();
+        let configured_builtin_servers = orchestrator.builtin_server_names();
+        let internal_server_keys: HashSet<String> = mcp_servers
+            .iter()
+            .filter_map(|binding| {
+                if configured_internal_servers.contains(&binding.server_key) {
+                    Some(binding.server_key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let builtin_server_keys: HashSet<String> = mcp_servers
+            .iter()
+            .filter_map(|binding| {
+                if configured_builtin_servers.contains(&binding.server_key) {
+                    Some(binding.server_key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let internal_non_builtin_server_labels: HashSet<String> = mcp_servers
+            .iter()
+            .filter(|binding| {
+                internal_server_keys.contains(&binding.server_key)
+                    && !builtin_server_keys.contains(&binding.server_key)
+            })
+            .map(|binding| binding.label.clone())
+            .collect();
         // Filter out servers configured with builtin_type from the visible list.
-        let builtin_names = orchestrator.builtin_server_names();
         let visible_mcp_servers: Vec<McpServerBinding> = mcp_servers
             .iter()
-            .filter(|b| !builtin_names.contains(&b.server_key))
+            .filter(|b| !configured_builtin_servers.contains(&b.server_key))
             .cloned()
             .collect();
 
         Self {
             orchestrator,
-            request_ctx,
+            request_id,
+            tenant_ctx,
+            forwarded_headers,
             all_mcp_servers: mcp_servers,
             mcp_servers: visible_mcp_servers,
             mcp_tools,
             exposed_name_map,
             exposed_name_by_qualified,
+            internal_server_keys,
+            builtin_server_keys,
+            internal_non_builtin_server_labels,
         }
     }
 
@@ -141,8 +205,8 @@ impl<'a> McpToolSession<'a> {
         self.orchestrator
     }
 
-    pub fn request_ctx(&self) -> &McpRequestContext<'a> {
-        &self.request_ctx
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 
     /// Returns only non-builtin MCP servers
@@ -177,9 +241,21 @@ impl<'a> McpToolSession<'a> {
     ///
     /// Uses `buffered()` to cap in-flight requests while preserving input ordering.
     pub async fn execute_tools(&self, inputs: Vec<ToolExecutionInput>) -> Vec<ToolExecutionOutput> {
+        self.execute_tool_results(inputs)
+            .await
+            .into_iter()
+            .map(ToolExecutionResult::into_output)
+            .collect()
+    }
+
+    /// Execute multiple tools concurrently while preserving pending approval state.
+    pub async fn execute_tool_results(
+        &self,
+        inputs: Vec<ToolExecutionInput>,
+    ) -> Vec<ToolExecutionResult> {
         const MAX_IN_FLIGHT_TOOL_CALLS: usize = 8;
         stream::iter(inputs)
-            .map(|input| self.execute_tool(input))
+            .map(|input| self.execute_tool_result(input))
             .buffered(MAX_IN_FLIGHT_TOOL_CALLS)
             .collect()
             .await
@@ -187,13 +263,19 @@ impl<'a> McpToolSession<'a> {
 
     /// Execute a single tool using this session's exposed-name mapping.
     pub async fn execute_tool(&self, input: ToolExecutionInput) -> ToolExecutionOutput {
+        self.execute_tool_result(input).await.into_output()
+    }
+
+    /// Execute a single tool while preserving pending approval state.
+    pub async fn execute_tool_result(&self, input: ToolExecutionInput) -> ToolExecutionResult {
         let invoked_name = input.tool_name.clone();
 
         if let Some(binding) = self.exposed_name_map.get(&invoked_name) {
             let resolved_tool_name = binding.resolved_tool_name.clone();
-            let mut output = self
+            let request_ctx = self.request_ctx_for(binding.approval_mode);
+            let mut result = self
                 .orchestrator
-                .execute_tool_resolved(
+                .execute_tool_resolved_result(
                     ToolExecutionInput {
                         call_id: input.call_id,
                         tool_name: resolved_tool_name.clone(),
@@ -201,12 +283,20 @@ impl<'a> McpToolSession<'a> {
                     },
                     &binding.server_key,
                     &binding.server_label,
-                    &self.request_ctx,
+                    &request_ctx,
                 )
                 .await;
 
-            output.tool_name = invoked_name;
-            output
+            match &mut result {
+                ToolExecutionResult::Executed(output) => {
+                    output.tool_name = invoked_name;
+                }
+                ToolExecutionResult::PendingApproval(pending) => {
+                    pending.tool_name = invoked_name;
+                }
+            }
+
+            result
         } else {
             let fallback_label = self
                 .all_mcp_servers
@@ -215,7 +305,7 @@ impl<'a> McpToolSession<'a> {
                 .unwrap_or(DEFAULT_SERVER_LABEL)
                 .to_string();
             let err = format!("Tool '{invoked_name}' is not in this session's exposed tool map");
-            ToolExecutionOutput {
+            ToolExecutionResult::Executed(ToolExecutionOutput {
                 call_id: input.call_id,
                 tool_name: invoked_name.clone(),
                 server_key: UNKNOWN_SERVER_KEY.to_string(),
@@ -226,7 +316,7 @@ impl<'a> McpToolSession<'a> {
                 error_message: Some(err),
                 response_format: ResponseFormat::Passthrough,
                 duration: std::time::Duration::default(),
-            }
+            })
         }
     }
 
@@ -246,6 +336,111 @@ impl<'a> McpToolSession<'a> {
             .get(tool_name)
             .map(|binding| binding.server_label.clone())
             .unwrap_or_else(|| fallback_label.to_string())
+    }
+
+    /// Apply request-time approval configuration to exposed tools in this session.
+    pub fn configure_response_tools_approval(&mut self, tools: &[ResponseTool]) {
+        for tool in tools {
+            let ResponseTool::Mcp(mcp_tool) = tool else {
+                continue;
+            };
+
+            let approval_mode = match mcp_tool.require_approval.as_ref() {
+                Some(RequireApproval::Mode(RequireApprovalMode::Always)) => {
+                    ApprovalMode::Interactive
+                }
+                _ => ApprovalMode::PolicyOnly,
+            };
+
+            if approval_mode == ApprovalMode::PolicyOnly {
+                continue;
+            }
+
+            // T11: the legacy `allowed_tools: Vec<String>` wire shape is now
+            // `McpAllowedTools` (untagged union of `List(Vec<String>)` or
+            // `Filter(McpToolFilter { read_only?, tool_names? })`). Project
+            // union variants back into the flat name-list scoping used here:
+            //   * `None`, or `Filter { None, None }` → no name constraint
+            //     (all bindings for this server inherit the explicit approval
+            //     mode).
+            //   * `List(names)` / `Filter { tool_names: Some(v), .. }` →
+            //     constrain by explicit names.
+            //   * `Filter { tool_names: None, read_only: Some(_) }` → `None`.
+            //     `readOnlyHint`-based filtering is unimplemented, but the
+            //     safe-default direction for *approval scoping* is the
+            //     opposite of exposure: narrowing to an empty name list here
+            //     would drop the caller's explicit approval mode for all
+            //     bindings (they'd fall back to `PolicyOnly`, which is
+            //     auto-approve-by-policy — LESS restrictive). Returning
+            //     `None` applies the requested approval mode to every
+            //     binding on the server, matching the "over-gate is safer
+            //     than under-gate" contract for approval prompts.
+            let allowed_tool_names: Option<&[String]> =
+                mcp_tool.allowed_tools.as_ref().and_then(|at| match at {
+                    McpAllowedTools::List(names) => Some(names.as_slice()),
+                    McpAllowedTools::Filter(filter) => filter.tool_names.as_deref(),
+                });
+            for binding in self.exposed_name_map.values_mut() {
+                if binding.server_label != mcp_tool.server_label {
+                    continue;
+                }
+                if let Some(allowed_tool_names) = allowed_tool_names {
+                    if !allowed_tool_names
+                        .iter()
+                        .any(|allowed_tool_name| allowed_tool_name == &binding.resolved_tool_name)
+                    {
+                        continue;
+                    }
+                }
+                binding.approval_mode = approval_mode;
+            }
+        }
+    }
+
+    /// Returns true if the bound server label belongs to an internal server.
+    pub fn is_internal_server_label(&self, server_label: &str) -> bool {
+        self.all_mcp_servers.iter().any(|binding| {
+            binding.label == server_label && self.is_internal_server_key(&binding.server_key)
+        })
+    }
+
+    /// Returns true if the bound server label is internal and not builtin-routed.
+    ///
+    /// Use this helper in redaction paths so internal filtering behavior stays
+    /// consistent across response assembly code paths.
+    pub fn is_internal_non_builtin_server_label(&self, server_label: &str) -> bool {
+        self.internal_non_builtin_server_labels
+            .contains(server_label)
+    }
+
+    /// Returns true if the given tool resolves to an internal server.
+    pub fn is_internal_tool(&self, tool_name: &str) -> bool {
+        self.exposed_name_map
+            .get(tool_name)
+            .is_some_and(|binding| self.is_internal_server_key(&binding.associated_server_key))
+    }
+
+    /// Returns true if the bound server label belongs to a builtin-routed server.
+    pub fn is_builtin_server_label(&self, server_label: &str) -> bool {
+        self.all_mcp_servers.iter().any(|binding| {
+            binding.label == server_label && self.builtin_server_keys.contains(&binding.server_key)
+        })
+    }
+
+    /// Returns true if the given tool resolves to a builtin-routed server.
+    pub fn is_builtin_tool(&self, tool_name: &str) -> bool {
+        self.exposed_name_map
+            .get(tool_name)
+            .is_some_and(|binding| binding.is_builtin_routed)
+    }
+
+    /// Returns true if the given tool resolves to an internal, non-builtin server.
+    pub fn is_internal_non_builtin_tool(&self, tool_name: &str) -> bool {
+        self.is_internal_tool(tool_name) && !self.is_builtin_tool(tool_name)
+    }
+
+    fn is_internal_server_key(&self, server_key: &str) -> bool {
+        self.internal_server_keys.contains(server_key)
     }
 
     /// List tools for a single server key.
@@ -311,7 +506,11 @@ impl<'a> McpToolSession<'a> {
     /// 1. `mcp_list_tools` items (one per server) — prepended
     /// 2. `tool_call_items` (mcp_call / web_search_call / etc.) — after list_tools
     /// 3. Existing items (messages, etc.) — remain at end
-    pub fn inject_mcp_output_items(
+    ///
+    /// Test-only helper for legacy ordering assertions.
+    /// Production code should use `inject_client_visible_mcp_output_items`.
+    #[cfg(test)]
+    fn inject_mcp_output_items(
         &self,
         output: &mut Vec<openai_protocol::responses::ResponseOutputItem>,
         tool_call_items: Vec<openai_protocol::responses::ResponseOutputItem>,
@@ -333,9 +532,195 @@ impl<'a> McpToolSession<'a> {
         output.extend(existing);
     }
 
+    /// Inject only client-visible MCP metadata and call items into response output.
+    ///
+    /// Visibility policy:
+    /// - Hide builtin `mcp_list_tools` (builtin tools surface under their own type)
+    /// - Hide internal non-builtin `mcp_list_tools`
+    /// - Hide internal non-builtin passthrough `mcp_call`/`mcp_approval_request`
+    /// - Keep builtin-routed call items visible
+    /// - Keep user-defined function calls visible even on name collisions
+    pub fn inject_client_visible_mcp_output_items(
+        &self,
+        output: &mut Vec<openai_protocol::responses::ResponseOutputItem>,
+        tool_call_items: Vec<openai_protocol::responses::ResponseOutputItem>,
+        user_function_names: &HashSet<String>,
+    ) {
+        let existing = std::mem::take(output);
+        output.reserve(self.mcp_servers.len() + tool_call_items.len() + existing.len());
+
+        // Use mcp_servers (excludes builtin) to match streaming path behavior.
+        for binding in &self.mcp_servers {
+            if !self.is_internal_non_builtin_server_label(&binding.label) {
+                output.push(self.build_mcp_list_tools_item(&binding.label, &binding.server_key));
+            }
+        }
+
+        for item in tool_call_items {
+            if self.is_client_visible_output_item(&item, user_function_names) {
+                output.push(item);
+            }
+        }
+
+        // Apply the same visibility policy to existing items (e.g. FunctionToolCall
+        // for executed MCP tools emitted by build_tool_response in the mixed
+        // function+MCP early-exit path).
+        for item in existing {
+            if self.is_client_visible_output_item(&item, user_function_names) {
+                output.push(item);
+            }
+        }
+    }
+
+    fn is_client_visible_output_item(
+        &self,
+        item: &openai_protocol::responses::ResponseOutputItem,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        use openai_protocol::responses::ResponseOutputItem;
+
+        match item {
+            ResponseOutputItem::McpListTools { server_label, .. } => {
+                !self.is_builtin_server_label(server_label)
+                    && !self.is_internal_non_builtin_server_label(server_label)
+            }
+            ResponseOutputItem::McpCall {
+                server_label, name, ..
+            }
+            | ResponseOutputItem::McpApprovalRequest {
+                server_label, name, ..
+            } => !self.should_hide_mcp_call_like_by_label(name, server_label),
+            ResponseOutputItem::FunctionToolCall { name, .. } => {
+                !self.should_hide_function_call_like(name, user_function_names)
+            }
+            ResponseOutputItem::WebSearchCall { .. }
+            | ResponseOutputItem::CodeInterpreterCall { .. }
+            | ResponseOutputItem::FileSearchCall { .. }
+            | ResponseOutputItem::ImageGenerationCall { .. }
+            | ResponseOutputItem::ComputerCall { .. }
+            | ResponseOutputItem::ComputerCallOutput { .. }
+            | ResponseOutputItem::ShellCall { .. }
+            | ResponseOutputItem::ShellCallOutput { .. }
+            | ResponseOutputItem::ApplyPatchCall { .. }
+            | ResponseOutputItem::ApplyPatchCallOutput { .. }
+            | ResponseOutputItem::Message { .. }
+            | ResponseOutputItem::Reasoning { .. }
+            | ResponseOutputItem::Compaction { .. }
+            | ResponseOutputItem::LocalShellCall { .. }
+            | ResponseOutputItem::LocalShellCallOutput { .. } => true,
+        }
+    }
+
+    /// Returns true when a JSON tool entry should be hidden from client-facing responses.
+    ///
+    /// This is used by OpenAI non-streaming response normalization, where tools are handled
+    /// as `serde_json::Value` payloads instead of typed `ResponseOutputItem`s.
+    pub fn should_hide_tool_json(
+        &self,
+        tool: &serde_json::Value,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        match tool.get("type").and_then(|value| value.as_str()) {
+            Some("function") => Self::function_tool_name_json(tool)
+                .is_some_and(|name| self.should_hide_function_call_like(name, user_function_names)),
+            // MCP tool entries are keyed by server metadata, so function-name collision
+            // handling does not apply to this arm.
+            Some("mcp") => tool
+                .get("server_label")
+                .and_then(|value| value.as_str())
+                .is_some_and(|server_label| {
+                    self.is_internal_non_builtin_server_label(server_label)
+                }),
+            _ => false,
+        }
+    }
+
+    /// Returns true when a JSON output item should be hidden from client-facing responses.
+    ///
+    /// This keeps OpenAI non-streaming redaction aligned with session-level policy.
+    pub fn should_hide_output_item_json(
+        &self,
+        item: &serde_json::Value,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        match item.get("type").and_then(|value| value.as_str()) {
+            // mcp_list_tools is gateway-synthesized metadata. Hide for builtin servers
+            // (implementation detail) and internal non-builtin servers (privacy).
+            Some("mcp_list_tools") => item
+                .get("server_label")
+                .and_then(|value| value.as_str())
+                .is_some_and(|server_label| {
+                    self.is_builtin_server_label(server_label)
+                        || self.is_internal_non_builtin_server_label(server_label)
+                }),
+            Some("mcp_call") | Some("mcp_approval_request") => {
+                let matches_internal_server = item
+                    .get("server_label")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|server_label| {
+                        self.is_internal_non_builtin_server_label(server_label)
+                    });
+
+                match item.get("name").and_then(|value| value.as_str()) {
+                    Some(name) => {
+                        self.should_hide_mcp_call_like_by_server_flag(name, matches_internal_server)
+                    }
+                    _ => matches_internal_server,
+                }
+            }
+            Some("function_call") | Some("function_tool_call") => item
+                .get("name")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| self.should_hide_function_call_like(name, user_function_names)),
+            _ => false,
+        }
+    }
+
+    fn should_hide_mcp_call_like_by_label(&self, name: &str, server_label: &str) -> bool {
+        self.should_hide_mcp_call_like_by_server_flag(
+            name,
+            self.is_internal_non_builtin_server_label(server_label),
+        )
+    }
+
+    fn should_hide_mcp_call_like_by_server_flag(
+        &self,
+        name: &str,
+        matches_internal_server: bool,
+    ) -> bool {
+        if self.has_exposed_tool(name) {
+            self.is_internal_non_builtin_tool(name)
+        } else {
+            matches_internal_server
+        }
+    }
+
+    fn should_hide_function_call_like(
+        &self,
+        name: &str,
+        user_function_names: &HashSet<String>,
+    ) -> bool {
+        self.is_internal_tool(name) && !user_function_names.contains(name)
+    }
+
+    fn function_tool_name_json(tool: &serde_json::Value) -> Option<&str> {
+        let tool_type = tool.get("type").and_then(|value| value.as_str());
+        if tool_type != Some("function") {
+            return None;
+        }
+        tool.get("name")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(|value| value.as_str())
+            })
+    }
+
     fn build_exposed_function_tools(
         tools: &[ToolEntry],
         mcp_servers: &[McpServerBinding],
+        builtin_tool_bindings: &HashSet<QualifiedToolName>,
     ) -> (
         HashMap<String, ExposedToolBinding>,
         HashMap<QualifiedToolName, String>,
@@ -366,6 +751,7 @@ impl<'a> McpToolSession<'a> {
                 .unwrap_or(associated_server_key)
                 .to_string();
             let resolved_tool_name = entry.tool_name().to_string();
+            let is_builtin_routed = Self::builtin_binding_for_entry(entry, builtin_tool_bindings);
 
             let base_exposed_name = if name_counts.get(entry.tool_name()).copied().unwrap_or(0) <= 1
             {
@@ -396,9 +782,12 @@ impl<'a> McpToolSession<'a> {
                 exposed_name,
                 ExposedToolBinding {
                     server_key,
+                    associated_server_key: associated_server_key.to_string(),
                     server_label,
                     resolved_tool_name,
+                    is_builtin_routed,
                     response_format: entry.response_format.clone(),
+                    approval_mode: ApprovalMode::PolicyOnly,
                 },
             );
         }
@@ -469,6 +858,39 @@ impl<'a> McpToolSession<'a> {
                 .as_ref()
                 .is_some_and(|alias| allowed.contains(alias.target.tool_name()))
     }
+
+    fn builtin_tool_bindings(orchestrator: &McpOrchestrator) -> HashSet<QualifiedToolName> {
+        [
+            BuiltinToolType::WebSearchPreview,
+            BuiltinToolType::CodeInterpreter,
+            BuiltinToolType::FileSearch,
+        ]
+        .into_iter()
+        .filter_map(|builtin_type| orchestrator.find_builtin_server(builtin_type))
+        .map(|(server_key, tool_name, _)| QualifiedToolName::new(server_key, tool_name))
+        .collect()
+    }
+
+    fn builtin_binding_for_entry(
+        entry: &ToolEntry,
+        builtin_tool_bindings: &HashSet<QualifiedToolName>,
+    ) -> bool {
+        let target = entry
+            .alias_target
+            .as_ref()
+            .map(|alias| &alias.target)
+            .unwrap_or(&entry.qualified_name);
+        builtin_tool_bindings.contains(target)
+    }
+
+    fn request_ctx_for(&self, approval_mode: ApprovalMode) -> McpRequestContext<'a> {
+        self.orchestrator.create_request_context_with_headers(
+            self.request_id.clone(),
+            self.tenant_ctx.clone(),
+            approval_mode,
+            self.forwarded_headers.clone(),
+        )
+    }
 }
 
 fn sanitize_tool_token(input: &str) -> String {
@@ -492,6 +914,8 @@ fn sanitize_tool_token(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::core::config::Tool as McpTool;
 
@@ -525,6 +949,14 @@ mod tests {
 
         assert!(session.mcp_servers().is_empty());
         assert!(session.mcp_tools().is_empty());
+    }
+
+    #[test]
+    fn test_session_creation_keeps_request_id() {
+        let orchestrator = McpOrchestrator::new_test();
+        let session = McpToolSession::new(&orchestrator, vec![], "test-request");
+
+        assert_eq!(session.request_id(), "test-request");
     }
 
     #[test]
@@ -593,6 +1025,60 @@ mod tests {
 
         assert!(session.has_exposed_tool("test_tool"));
         assert_eq!(session.mcp_tools().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_result_preserves_pending_approval() {
+        let orchestrator = McpOrchestrator::new_test();
+
+        let tool = create_test_tool("test_tool");
+        let entry = ToolEntry::from_server_tool("server1", tool);
+        orchestrator.tool_inventory().insert_entry(entry);
+
+        let mut session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "label1".to_string(),
+                server_key: "server1".to_string(),
+                allowed_tools: None,
+            }],
+            "test-request",
+        );
+        session.configure_response_tools_approval(&[ResponseTool::Mcp(
+            openai_protocol::responses::McpTool {
+                server_url: Some("http://example.com/mcp".to_string()),
+                authorization: None,
+                headers: None,
+                server_label: "label1".to_string(),
+                server_description: None,
+                require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Always)),
+                allowed_tools: None,
+                connector_id: None,
+                defer_loading: None,
+            },
+        )]);
+
+        let result = session
+            .execute_tool_result(ToolExecutionInput {
+                call_id: "call-1".to_string(),
+                tool_name: "test_tool".to_string(),
+                arguments: json!({"hello": "world"}),
+            })
+            .await;
+
+        match result {
+            ToolExecutionResult::PendingApproval(pending) => {
+                assert_eq!(pending.call_id, "call-1");
+                assert_eq!(pending.tool_name, "test_tool");
+                assert_eq!(pending.server_key, "server1");
+                assert_eq!(pending.server_label, "label1");
+                assert_eq!(pending.approval_request.server_key, "server1");
+                assert_eq!(pending.approval_request.tool_name, "test_tool");
+            }
+            ToolExecutionResult::Executed(output) => {
+                panic!("expected pending approval, got executed result: {output:?}")
+            }
+        }
     }
 
     #[test]
@@ -729,6 +1215,7 @@ mod tests {
                     tools: None,
                     builtin_type: Some(BuiltinToolType::WebSearchPreview),
                     builtin_tool_name: Some("brave_web_search".to_string()),
+                    internal: false,
                 },
                 McpServerConfig {
                     name: "regular-server".to_string(),
@@ -742,6 +1229,7 @@ mod tests {
                     tools: None,
                     builtin_type: None,
                     builtin_tool_name: None,
+                    internal: false,
                 },
             ],
             ..Default::default()
@@ -776,6 +1264,56 @@ mod tests {
 
         // all_mcp_servers() should return everything
         assert_eq!(session.all_mcp_servers().len(), 2);
+    }
+
+    #[test]
+    fn test_is_builtin_tool_scoped_to_builtin_binding_only() {
+        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig, McpTransport};
+
+        let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
+            servers: vec![McpServerConfig {
+                name: "internal-server".to_string(),
+                transport: McpTransport::Sse {
+                    url: "http://localhost:3000/sse".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: Some(BuiltinToolType::WebSearchPreview),
+                builtin_tool_name: Some("brave_web_search".to_string()),
+                internal: true,
+            }],
+            ..Default::default()
+        });
+
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "internal-server",
+                create_test_tool("brave_web_search"),
+            ));
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "internal-server",
+                create_test_tool("internal_non_builtin_tool"),
+            ));
+
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "internal-label".to_string(),
+                server_key: "internal-server".to_string(),
+                allowed_tools: None,
+            }],
+            "test-request",
+        );
+
+        assert!(session.is_builtin_tool("brave_web_search"));
+        assert!(!session.is_builtin_tool("internal_non_builtin_tool"));
+        assert!(session.is_internal_non_builtin_tool("internal_non_builtin_tool"));
     }
 
     #[test]
@@ -899,6 +1437,167 @@ mod tests {
         assert_eq!(session.mcp_tools()[0].tool_name(), "web_search");
     }
 
+    #[test]
+    fn test_is_internal_tool_for_internal_server() {
+        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "internal-server".to_string(),
+                transport: McpTransport::Sse {
+                    url: "http://localhost:3000/sse".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: true,
+            }],
+            ..Default::default()
+        };
+
+        let orchestrator = McpOrchestrator::new_test_with_config(config);
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "internal-server",
+                create_test_tool("internal_search"),
+            ));
+
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "internal-label".to_string(),
+                server_key: "internal-server".to_string(),
+                allowed_tools: None,
+            }],
+            "test-request",
+        );
+
+        assert!(session.has_exposed_tool("internal_search"));
+        assert!(session.is_internal_tool("internal_search"));
+        assert!(session.is_internal_server_label("internal-label"));
+    }
+
+    #[test]
+    fn test_is_internal_tool_for_alias_targeting_internal_server() {
+        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "internal-server".to_string(),
+                transport: McpTransport::Sse {
+                    url: "http://localhost:3000/sse".to_string(),
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: true,
+            }],
+            ..Default::default()
+        };
+
+        let orchestrator = McpOrchestrator::new_test_with_config(config);
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "internal-server",
+                create_test_tool("internal_search"),
+            ));
+
+        orchestrator
+            .register_alias(
+                "alias_search",
+                "internal-server",
+                "internal_search",
+                None,
+                ResponseFormat::Passthrough,
+            )
+            .expect("alias registration should succeed");
+
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "internal-label".to_string(),
+                server_key: "internal-server".to_string(),
+                allowed_tools: None,
+            }],
+            "test-request",
+        );
+
+        assert!(session.has_exposed_tool("alias_search"));
+        assert!(session.is_internal_tool("alias_search"));
+    }
+
+    #[test]
+    fn test_is_internal_server_label_checks_all_bindings_for_shared_label() {
+        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+
+        let config = McpConfig {
+            servers: vec![
+                McpServerConfig {
+                    name: "public-server".to_string(),
+                    transport: McpTransport::Sse {
+                        url: "http://localhost:3000/sse".to_string(),
+                        token: None,
+                        headers: HashMap::new(),
+                    },
+                    proxy: None,
+                    required: false,
+                    tools: None,
+                    builtin_type: None,
+                    builtin_tool_name: None,
+                    internal: false,
+                },
+                McpServerConfig {
+                    name: "internal-server".to_string(),
+                    transport: McpTransport::Sse {
+                        url: "http://localhost:3001/sse".to_string(),
+                        token: None,
+                        headers: HashMap::new(),
+                    },
+                    proxy: None,
+                    required: false,
+                    tools: None,
+                    builtin_type: None,
+                    builtin_tool_name: None,
+                    internal: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let orchestrator = McpOrchestrator::new_test_with_config(config);
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![
+                McpServerBinding {
+                    label: "shared-label".to_string(),
+                    server_key: "public-server".to_string(),
+                    allowed_tools: None,
+                },
+                McpServerBinding {
+                    label: "shared-label".to_string(),
+                    server_key: "internal-server".to_string(),
+                    allowed_tools: None,
+                },
+            ],
+            "test-request",
+        );
+
+        assert!(
+            session.is_internal_server_label("shared-label"),
+            "shared labels should be internal when any matching binding is internal"
+        );
+    }
+
     /// Verify that `inject_mcp_output_items` produces the exact ordering:
     ///   1. mcp_list_tools items (one per server, in server order)
     ///   2. tool_call_items (in their original order)
@@ -950,12 +1649,14 @@ mod tests {
             role: "assistant".to_string(),
             content: vec![],
             status: "completed".to_string(),
+            phase: None,
         };
         let existing_2 = ResponseOutputItem::Message {
             id: "msg_existing_2".to_string(),
             role: "assistant".to_string(),
             content: vec![],
             status: "completed".to_string(),
+            phase: None,
         };
 
         // Tool call items injected by the router.
@@ -1074,5 +1775,29 @@ mod tests {
         assert!(session.has_exposed_tool("deepwiki_read"));
         let listed_server2 = session.list_tools_for_server("server2");
         assert_eq!(listed_server2.len(), 2);
+    }
+
+    #[test]
+    fn test_session_preserves_forwarded_headers_in_request_context() {
+        let orchestrator = McpOrchestrator::new_test();
+        let session = McpToolSession::new_with_headers(
+            &orchestrator,
+            vec![],
+            "test-request",
+            HashMap::from([
+                ("openai-project".to_string(), "project-123".to_string()),
+                ("opc-request-id".to_string(), "req-123".to_string()),
+            ]),
+        );
+        let request_ctx = session.request_ctx_for(ApprovalMode::PolicyOnly);
+
+        assert_eq!(
+            request_ctx.forwarded_headers.get("openai-project"),
+            Some(&"project-123".to_string())
+        );
+        assert_eq!(
+            request_ctx.forwarded_headers.get("opc-request-id"),
+            Some(&"req-123".to_string())
+        );
     }
 }

@@ -162,7 +162,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_responses_total",
-        "Total HTTP responses by status_code and error_code"
+        "Total HTTP responses by path, status_code and error_code"
     );
     describe_gauge!(
         "smg_http_connections_active",
@@ -389,6 +389,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_REALTIME_SESSIONS: &str = "realtime_sessions";
     pub const ENDPOINT_REALTIME_CLIENT_SECRETS: &str = "realtime_client_secrets";
     pub const ENDPOINT_REALTIME_TRANSCRIPTION: &str = "realtime_transcription";
+    pub const ENDPOINT_AUDIO_TRANSCRIPTIONS: &str = "audio_transcriptions";
 
     // Connection modes
     pub const CONNECTION_WEBSOCKET: &str = "websocket";
@@ -515,11 +516,13 @@ impl Metrics {
     }
 
     /// Record HTTP response.
-    pub fn record_http_response(status_code: u16, error_code: &str) {
+    pub fn record_http_response(path: &str, status_code: u16, error_code: &str) {
+        let path_interned = intern_string(path);
         let status_str: Cow<'static, str> = status_code_to_cow(status_code);
         let error_interned = intern_string(error_code);
         counter!(
             "smg_http_responses_total",
+            "path" => path_interned,
             "status_code" => status_str,
             "error_code" => error_interned
         )

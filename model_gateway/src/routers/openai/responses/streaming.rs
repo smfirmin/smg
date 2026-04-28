@@ -19,7 +19,8 @@ use futures_util::StreamExt;
 use openai_protocol::{
     event_types::{
         is_function_call_type, is_response_event, CodeInterpreterCallEvent, FileSearchCallEvent,
-        FunctionCallEvent, ItemType, McpEvent, OutputItemEvent, ResponseEvent, WebSearchCallEvent,
+        FunctionCallEvent, ImageGenerationCallEvent, ItemType, McpEvent, OutputItemEvent,
+        ResponseEvent, WebSearchCallEvent,
     },
     responses::{ResponseTool, ResponsesRequest},
 };
@@ -44,18 +45,22 @@ const SSE_DONE: &str = "data: [DONE]\n\n";
 use crate::{
     observability::metrics::Metrics,
     routers::{
+        common::{
+            header_utils::{
+                extract_forwardable_request_headers, preserve_response_headers, ApiProvider,
+            },
+            mcp_utils::DEFAULT_MAX_ITERATIONS,
+            persistence_utils::persist_conversation_items,
+        },
         error,
-        header_utils::{preserve_response_headers, ApiProvider},
-        mcp_utils::DEFAULT_MAX_ITERATIONS,
         openai::{
             context::{RequestContext, StreamingEventContext, StreamingRequest},
             mcp::{
                 build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-                prepare_mcp_tools_as_functions, send_mcp_list_tools_events, StreamAction,
-                StreamingToolHandler, ToolLoopState,
+                mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions,
+                send_mcp_list_tools_events, StreamAction, StreamingToolHandler, ToolLoopState,
             },
         },
-        persistence_utils::persist_conversation_items,
     },
 };
 
@@ -147,6 +152,9 @@ pub(super) fn apply_event_transformations_inplace(
                             // Determine item type and ID prefix based on response_format
                             let (new_type, id_prefix) = match response_format {
                                 ResponseFormat::WebSearchCall => (ItemType::WEB_SEARCH_CALL, "ws_"),
+                                ResponseFormat::ImageGenerationCall => {
+                                    (ItemType::IMAGE_GENERATION_CALL, "ig_")
+                                }
                                 _ => (ItemType::MCP_CALL, "mcp_"),
                             };
 
@@ -410,7 +418,8 @@ pub(super) fn forward_streaming_event(
 }
 
 /// Inject in_progress event after a tool call item is added.
-/// Handles mcp_call, web_search_call, code_interpreter_call, and file_search_call items.
+/// Handles mcp_call, web_search_call, code_interpreter_call, file_search_call,
+/// and image_generation_call items.
 /// Returns false if client disconnected.
 fn maybe_inject_tool_in_progress(
     parsed_data: &Value,
@@ -429,6 +438,7 @@ fn maybe_inject_tool_in_progress(
         ItemType::WEB_SEARCH_CALL => WebSearchCallEvent::IN_PROGRESS,
         ItemType::CODE_INTERPRETER_CALL => CodeInterpreterCallEvent::IN_PROGRESS,
         ItemType::FILE_SEARCH_CALL => FileSearchCallEvent::IN_PROGRESS,
+        ItemType::IMAGE_GENERATION_CALL => ImageGenerationCallEvent::IN_PROGRESS,
         _ => return true, // Not a tool call item, nothing to inject
     };
 
@@ -477,7 +487,7 @@ pub(super) fn send_final_response_event(
         inject_mcp_metadata_streaming(&mut final_response, state, session);
     }
 
-    restore_original_tools(&mut final_response, ctx.original_request);
+    restore_original_tools(&mut final_response, ctx.original_request, None);
     patch_response_with_request_metadata(
         &mut final_response,
         ctx.original_request,
@@ -672,6 +682,7 @@ pub(super) fn handle_streaming_with_tool_interception(
     let should_store = req.original_body.store.unwrap_or(true);
     let original_request = req.original_body;
     let previous_response_id = req.previous_response_id;
+    let existing_mcp_list_tools_labels = req.existing_mcp_list_tools_labels;
     let url = req.url;
     let storage = req.storage;
 
@@ -680,21 +691,26 @@ pub(super) fn handle_streaming_with_tool_interception(
     let headers_opt = headers.cloned();
     let payload_clone = payload.clone();
     let orchestrator_clone = Arc::clone(orchestrator);
+    let forwarded_headers = extract_forwardable_request_headers(headers);
 
     #[expect(
         clippy::disallowed_methods,
         reason = "fire-and-forget MCP tool loop; gateway shutdown need not wait for individual tool loops"
     )]
     tokio::spawn(async move {
-        let mut state = ToolLoopState::new(original_request.input.clone());
+        let mut state = ToolLoopState::new(
+            original_request.input.clone(),
+            existing_mcp_list_tools_labels,
+        );
         let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
         // Create session inside spawned task (borrows from orchestrator_clone which lives in closure)
         let session_request_id = format!("resp_{}", uuid::Uuid::now_v7());
-        let session = McpToolSession::new(
+        let session = McpToolSession::new_with_headers(
             &orchestrator_clone,
             mcp_servers.clone(),
             &session_request_id,
+            forwarded_headers.clone(),
         );
         let mut current_payload = payload_clone;
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
@@ -705,6 +721,10 @@ pub(super) fn handle_streaming_with_tool_interception(
         let mut sequence_number: u64 = 0;
         let mut next_output_index: usize = 0;
         let mut preserved_response_id: Option<String> = None;
+        let list_tools_bindings = mcp_list_tools_bindings_to_emit(
+            &state.existing_mcp_list_tools_labels,
+            session.mcp_servers(),
+        );
 
         let streaming_ctx = StreamingEventContext {
             original_request: &original_request,
@@ -813,16 +833,16 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     if is_in_progress {
                                         seen_in_progress = true;
                                         if !mcp_list_tools_sent {
-                                            for binding in session.mcp_servers() {
+                                            for (server_label, server_key) in &list_tools_bindings {
                                                 let list_tools_index =
                                                     handler.allocate_synthetic_output_index();
                                                 if !send_mcp_list_tools_events(
                                                     &tx,
                                                     &session,
-                                                    &binding.label,
+                                                    server_label,
                                                     list_tools_index,
                                                     &mut sequence_number,
-                                                    &binding.server_key,
+                                                    server_key,
                                                 ) {
                                                     // Client disconnected
                                                     return;
@@ -835,19 +855,48 @@ pub(super) fn handle_streaming_with_tool_interception(
                                 StreamAction::Buffer => {
                                     // Don't forward, just buffer
                                 }
-                                StreamAction::ExecuteTools => {
-                                    if !forward_streaming_event(
-                                        SseEventData {
-                                            raw_block: &raw_block,
-                                            event_name,
-                                            data: data.as_ref(),
-                                            pre_parsed: None,
-                                        },
-                                        &mut handler,
-                                        &tx,
-                                        &streaming_ctx,
-                                        &mut sequence_number,
-                                    ) {
+                                StreamAction::Drop => {
+                                    // R6.7c native passthrough: upstream
+                                    // emitted an `output_item.done` for a
+                                    // hosted tool-call item that we did
+                                    // NOT wrap as a function_call (and so
+                                    // did not track in `pending_calls`).
+                                    // The upstream envelope arrives
+                                    // mis-ordered BEFORE
+                                    // `response.<type>.completed`, so we
+                                    // drop it here to preserve the wire
+                                    // invariant that `output_item.done`
+                                    // is the LAST event for a given item.
+                                    // Unlike `ExecuteTools`, this does NOT
+                                    // kick the tool loop — there is no
+                                    // dispatched call to finish.
+                                }
+                                StreamAction::ExecuteTools {
+                                    forward_triggering_event,
+                                } => {
+                                    // When the upstream signals tool completion via
+                                    // `output_item.done` (instead of a preceding
+                                    // `function_call_arguments.done`), forwarding the
+                                    // event here would emit an umbrella
+                                    // `response.output_item.done` BEFORE
+                                    // `response.<tool>.completed`, violating spec
+                                    // sub-event ordering. The tool loop emits its own
+                                    // `output_item.done` at the correct position after
+                                    // the `.completed` sub-event; suppress here.
+                                    if forward_triggering_event
+                                        && !forward_streaming_event(
+                                            SseEventData {
+                                                raw_block: &raw_block,
+                                                event_name,
+                                                data: data.as_ref(),
+                                                pre_parsed: None,
+                                            },
+                                            &mut handler,
+                                            &tx,
+                                            &streaming_ctx,
+                                            &mut sequence_number,
+                                        )
+                                    {
                                         return;
                                     }
                                     tool_calls_detected = true;
@@ -902,7 +951,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                     }
                     inject_mcp_metadata_streaming(&mut response_json, &state, &session);
 
-                    restore_original_tools(&mut response_json, &original_request);
+                    restore_original_tools(&mut response_json, &original_request, Some(&session));
                     patch_response_with_request_metadata(
                         &mut response_json,
                         &original_request,
@@ -960,7 +1009,10 @@ pub(super) fn handle_streaming_with_tool_interception(
                 return;
             }
 
-            // Execute all pending tool calls
+            // Execute all pending tool calls. Pass the caller-declared tools so
+            // hosted-tool overrides (e.g. image_generation size/quality) are
+            // merged into dispatch args before MCP execution. The request-level
+            // `user` is also forwarded into hosted-tool dispatch args.
             if !execute_streaming_tool_calls(
                 pending_calls,
                 &session,
@@ -968,6 +1020,8 @@ pub(super) fn handle_streaming_with_tool_interception(
                 &mut state,
                 &mut sequence_number,
                 &original_request.model,
+                original_request.tools.as_deref().unwrap_or(&[]),
+                original_request.user.as_deref(),
             )
             .await
             {
@@ -1010,7 +1064,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
 /// Main entry point for streaming responses
 pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
-    use crate::routers::mcp_utils::ensure_request_mcp_client;
+    use crate::routers::common::mcp_utils::ensure_request_mcp_client;
 
     let worker = match ctx.worker() {
         Some(w) => w.clone(),

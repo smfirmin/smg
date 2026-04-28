@@ -9,9 +9,7 @@
 
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
-    common::{
-        FunctionCallResponse, JsonSchemaFormat, ResponseFormat, StreamOptions, ToolCall, UsageInfo,
-    },
+    common::{FunctionCallResponse, JsonSchemaFormat, ResponseFormat, ToolCall, UsageInfo},
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
         ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
@@ -145,11 +143,55 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         });
                     }
                     ResponseInputOutputItem::McpApprovalResponse { .. }
-                    | ResponseInputOutputItem::McpApprovalRequest { .. } => {
+                    | ResponseInputOutputItem::McpApprovalRequest { .. }
+                    | ResponseInputOutputItem::ComputerCall { .. }
+                    | ResponseInputOutputItem::ComputerCallOutput { .. }
+                    | ResponseInputOutputItem::McpCall { .. }
+                    | ResponseInputOutputItem::McpListTools { .. } => {
                         warn!(
                             function = "responses_to_chat",
                             "Approval item reached chat conversion"
                         );
+                        return Err("Unsupported input item type".to_string());
+                    }
+                    ResponseInputOutputItem::ImageGenerationCall { .. } => {
+                        warn!(
+                            function = "responses_to_chat",
+                            "image_generation_call input item reached chat conversion"
+                        );
+                        return Err("Unsupported input item type".to_string());
+                    }
+                    ResponseInputOutputItem::Compaction { .. }
+                    | ResponseInputOutputItem::ItemReference { .. } => {
+                        return Err("Unsupported input item type".to_string());
+                    }
+                    ResponseInputOutputItem::CustomToolCall { .. }
+                    | ResponseInputOutputItem::CustomToolCallOutput { .. } => {
+                        warn!(
+                            function = "responses_to_chat",
+                            "Custom tool item reached chat conversion"
+                        );
+                        return Err("Unsupported input item type".to_string());
+                    }
+                    ResponseInputOutputItem::ShellCall { .. }
+                    | ResponseInputOutputItem::ShellCallOutput { .. } => {
+                        warn!(
+                            function = "responses_to_chat",
+                            "Shell tool item reached chat conversion"
+                        );
+                        return Err("Unsupported input item type".to_string());
+                    }
+                    ResponseInputOutputItem::ApplyPatchCall { .. }
+                    | ResponseInputOutputItem::ApplyPatchCallOutput { .. } => {
+                        warn!(
+                            function = "responses_to_chat",
+                            "apply_patch item reached chat conversion"
+                        );
+                        return Err("Unsupported input item type".to_string());
+                    }
+                    // T5 schema-only: forced-cascade arm, no behavior.
+                    ResponseInputOutputItem::LocalShellCall { .. }
+                    | ResponseInputOutputItem::LocalShellCallOutput { .. } => {
                         return Err("Unsupported input item type".to_string());
                     }
                 }
@@ -184,10 +226,15 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         temperature: req.temperature,
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
+        // Preserve caller-provided stream_options (e.g. `include_obfuscation: false`
+        // on the Responses API) and only default `include_usage` when the caller
+        // did not set it. Non-streaming requests intentionally drop stream_options.
         stream_options: if is_streaming {
-            Some(StreamOptions {
-                include_usage: Some(true),
-            })
+            let mut opts = req.stream_options.clone().unwrap_or_default();
+            if opts.include_usage.is_none() {
+                opts.include_usage = Some(true);
+            }
+            Some(opts)
         } else {
             None
         },
@@ -196,20 +243,26 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         top_p: req.top_p,
         skip_special_tokens: true,
         tools,
-        tool_choice: req.tool_choice.clone(),
+        tool_choice: req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice()),
         response_format: map_text_to_response_format(req.text.as_ref()),
         ..Default::default()
     })
 }
 
-/// Extract text content from ResponseContentPart array
+/// Extract text content from ResponseContentPart array. `Refusal` is
+/// losslessly representable as text and is preserved verbatim. Image / file
+/// parts are currently dropped; the gRPC regular path is text-only and
+/// relies on the multimodal pipeline for media handling (R1/R2/R3 will
+/// implement full media handling).
 fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
     content
         .iter()
         .filter_map(|part| match part {
             ResponseContentPart::InputText { text } => Some(text.as_str()),
             ResponseContentPart::OutputText { text, .. } => Some(text.as_str()),
-            ResponseContentPart::Unknown => None,
+            ResponseContentPart::Refusal { refusal } => Some(refusal.as_str()),
+            // R1/R2/R3 will implement full media handling
+            ResponseContentPart::InputImage { .. } | ResponseContentPart::InputFile { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("")
@@ -302,6 +355,7 @@ pub(crate) fn chat_to_responses(
                     logprobs: choice.logprobs.clone(),
                 }],
                 status: "completed".to_string(),
+                phase: None,
             });
         }
     }
@@ -309,14 +363,14 @@ pub(crate) fn chat_to_responses(
     // Convert reasoning content if present (O1-style models)
     if let Some(reasoning) = &choice.message.reasoning_content {
         if !reasoning.is_empty() {
-            output.push(ResponseOutputItem::Reasoning {
-                id: format!("reasoning_{}", chat_resp.id),
-                summary: vec![],
-                content: vec![ReasoningText {
+            output.push(ResponseOutputItem::new_reasoning(
+                format!("reasoning_{}", chat_resp.id),
+                vec![],
+                vec![ReasoningText {
                     text: reasoning.clone(),
                 }],
-                status: Some("completed".to_string()),
-            });
+                Some("completed".to_string()),
+            ));
         }
     }
 
@@ -371,6 +425,8 @@ pub(crate) fn chat_to_responses(
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::StreamOptions;
+
     use super::*;
 
     #[test]
@@ -400,6 +456,7 @@ mod tests {
                         text: "Hello!".to_string(),
                     }],
                     status: None,
+                    phase: None,
                 },
                 ResponseInputOutputItem::Message {
                     id: "msg_2".to_string(),
@@ -410,6 +467,7 @@ mod tests {
                         logprobs: None,
                     }],
                     status: None,
+                    phase: None,
                 },
             ]),
             ..Default::default()
@@ -429,5 +487,95 @@ mod tests {
         // Empty text should still create a user message, so this should succeed
         let result = responses_to_chat(&req);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_stream_options_include_obfuscation_roundtrip() {
+        // Regression: ensure caller-provided stream_options (e.g. `include_obfuscation`)
+        // are preserved through the Responses → Chat conversion when streaming.
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("hi".to_string()),
+            stream: Some(true),
+            stream_options: Some(StreamOptions {
+                include_usage: None,
+                include_obfuscation: Some(false),
+            }),
+            ..Default::default()
+        };
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert!(chat_req.stream);
+        let opts = chat_req
+            .stream_options
+            .expect("stream_options populated when streaming");
+        // Caller-provided value is preserved verbatim.
+        assert_eq!(opts.include_obfuscation, Some(false));
+        // include_usage defaults to true when absent so downstream consumers
+        // still emit the usage block at end-of-stream.
+        assert_eq!(opts.include_usage, Some(true));
+    }
+
+    #[test]
+    fn test_stream_options_caller_include_usage_preserved() {
+        // Caller-set `include_usage` must not be clobbered by the conversion layer.
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("hi".to_string()),
+            stream: Some(true),
+            stream_options: Some(StreamOptions {
+                include_usage: Some(false),
+                include_obfuscation: Some(true),
+            }),
+            ..Default::default()
+        };
+
+        let opts = responses_to_chat(&req).unwrap().stream_options.unwrap();
+        assert_eq!(opts.include_usage, Some(false));
+        assert_eq!(opts.include_obfuscation, Some(true));
+    }
+
+    #[test]
+    fn test_stream_options_non_streaming_dropped() {
+        // stream=false must produce None stream_options even if caller set it.
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("hi".to_string()),
+            stream: Some(false),
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: Some(false),
+            }),
+            ..Default::default()
+        };
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert!(!chat_req.stream);
+        assert!(chat_req.stream_options.is_none());
+    }
+
+    #[test]
+    fn test_image_generation_call_input_rejected() {
+        // Regression: `image_generation_call` items are server-produced
+        // output (populated via the shared MCP transformer) and must not
+        // be round-tripped back into the chat conversion as input.
+        // The regular gRPC path — used by non-Harmony text LLMs that only do
+        // function calling — rejects this variant with the same contract as
+        // sibling hosted-tool items (Computer/Shell/Custom/ApplyPatch).
+        let req = ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::ImageGenerationCall {
+                id: "ig_test".to_string(),
+                action: None,
+                background: None,
+                output_format: None,
+                quality: None,
+                result: Some("base64data".to_string()),
+                revised_prompt: Some("a cat".to_string()),
+                size: None,
+                status: None,
+            }]),
+            ..Default::default()
+        };
+
+        let result = responses_to_chat(&req);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Unsupported input item type");
     }
 }

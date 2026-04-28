@@ -3,6 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub mod cache;
+pub mod encoders;
+pub mod eos;
 pub mod factory;
 pub mod hub;
 pub mod mock;

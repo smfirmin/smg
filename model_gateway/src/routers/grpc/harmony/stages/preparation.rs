@@ -142,20 +142,17 @@ impl HarmonyPreparationStage {
         })?;
 
         // Step 4: Store results
-        ctx.state.preparation = Some(PreparationOutput {
-            original_text: None,
+        ctx.state.preparation = Some(PreparationOutput::Harmony {
             token_ids: build_output.input_ids,
-            processed_messages: None,
+            selection_text: build_output.selection_text,
             tool_constraints: constraint,
-            filtered_request: if matches!(body_ref, Cow::Owned(_)) {
-                Some(body_ref.into_owned())
+            modified_request: if matches!(body_ref, Cow::Owned(_)) {
+                Some(Box::new(body_ref.into_owned()))
             } else {
                 None
             },
-            harmony_mode: true,
-            selection_text: Some(build_output.selection_text),
-            harmony_messages: Some(build_output.harmony_messages),
-            harmony_stop_ids: Some(build_output.stop_token_ids),
+            harmony_messages: build_output.harmony_messages,
+            harmony_stop_ids: build_output.stop_token_ids,
         });
 
         Ok(None)
@@ -177,10 +174,15 @@ impl HarmonyPreparationStage {
         // Step 1: Extract function tools with schemas from ResponseTools
         let mut function_tools = extract_tools_from_response_tools(request.tools.as_deref());
 
+        let chat_tool_choice = request
+            .tool_choice
+            .as_ref()
+            .map(|tc| tc.to_chat_tool_choice());
+
         // Step 2: Filter tools based on tool_choice (AllowedTools or Function)
         // Note: Tool existence is already validated in ResponsesRequest::validate()
         if let Some(filtered) =
-            utils::filter_tools_by_tool_choice(&function_tools, request.tool_choice.as_ref())
+            utils::filter_tools_by_tool_choice(&function_tools, chat_tool_choice.as_ref())
         {
             function_tools = filtered;
         }
@@ -189,7 +191,7 @@ impl HarmonyPreparationStage {
         let tool_constraint = if function_tools.is_empty() {
             None
         } else {
-            Self::generate_tool_call_constraint(&function_tools, request.tool_choice.as_ref())
+            Self::generate_tool_call_constraint(&function_tools, chat_tool_choice.as_ref())
                 .map_err(|e| *e)?
         };
 
@@ -223,16 +225,13 @@ impl HarmonyPreparationStage {
         })?;
 
         // Step 4: Store results with constraint
-        ctx.state.preparation = Some(PreparationOutput {
-            original_text: None,
+        ctx.state.preparation = Some(PreparationOutput::Harmony {
             token_ids: build_output.input_ids,
-            processed_messages: None,
+            selection_text: build_output.selection_text,
             tool_constraints: constraint,
-            filtered_request: None,
-            harmony_mode: true,
-            selection_text: Some(build_output.selection_text),
-            harmony_messages: Some(build_output.harmony_messages),
-            harmony_stop_ids: Some(build_output.stop_token_ids),
+            modified_request: None,
+            harmony_messages: build_output.harmony_messages,
+            harmony_stop_ids: build_output.stop_token_ids,
         });
 
         Ok(None)

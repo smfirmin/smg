@@ -25,9 +25,13 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    middleware::TenantRequestMeta,
     observability::metrics::{metrics_labels, Metrics},
-    routers::RouterTrait,
-    worker::{is_retryable_status, RetryExecutor, WorkerRegistry},
+    routers::{
+        common::retry::{is_retryable_status, RetryExecutor},
+        RouterTrait,
+    },
+    worker::WorkerRegistry,
 };
 
 /// gRPC router implementation for SGLang
@@ -67,7 +71,7 @@ impl GrpcRouter {
         let _policy_registry = ctx.policy_registry.clone();
 
         // Create multimodal components (best-effort; non-fatal if initialization fails)
-        let multimodal = match MultimodalComponents::new() {
+        let multimodal = match MultimodalComponents::new(ctx.multimodal_config_registry.clone()) {
             Ok(mc) => Some(Arc::new(mc)),
             Err(e) => {
                 tracing::warn!("Multimodal components initialization failed (non-fatal): {e}");
@@ -80,6 +84,7 @@ impl GrpcRouter {
             tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
+            configured_tool_parser: ctx.configured_tool_parser.clone(),
             multimodal,
         });
 
@@ -143,6 +148,7 @@ impl GrpcRouter {
                 ctx.response_storage.clone(),
                 ctx.conversation_storage.clone(),
                 ctx.conversation_item_storage.clone(),
+                ctx.conversation_memory_writer.clone(),
                 mcp_orchestrator.clone(),
                 storage_request_context.clone(),
             )
@@ -171,6 +177,7 @@ impl GrpcRouter {
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -194,6 +201,7 @@ impl GrpcRouter {
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
+        let tenant_meta_cloned = tenant_meta.clone();
 
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
         let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
@@ -209,9 +217,10 @@ impl GrpcRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let tenant_meta = tenant_meta_cloned.clone();
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components)
+                        .execute_chat(request, headers, model_id, components, Some(tenant_meta))
                         .await
                 }
             },
@@ -240,6 +249,7 @@ impl GrpcRouter {
     async fn route_generate_impl(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &GenerateRequest,
         model_id: &str,
     ) -> Response {
@@ -250,6 +260,7 @@ impl GrpcRouter {
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
+        let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.pipeline;
 
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
@@ -266,9 +277,10 @@ impl GrpcRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let tenant_meta = tenant_meta_cloned.clone();
                 async move {
                     pipeline
-                        .execute_generate(request, headers, model_id, components)
+                        .execute_generate(request, headers, model_id, components, Some(tenant_meta))
                         .await
                 }
             },
@@ -299,6 +311,7 @@ impl GrpcRouter {
     async fn route_responses_impl(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &ResponsesRequest,
         model_id: &str,
     ) -> Response {
@@ -326,14 +339,19 @@ impl GrpcRouter {
                 self.harmony_responses_context
                     .conversation_item_storage
                     .clone(),
+                self.harmony_responses_context
+                    .conversation_memory_writer
+                    .clone(),
                 self.harmony_responses_context.mcp_orchestrator.clone(),
                 smg_data_connector::current_request_context(),
             );
 
             if body.stream.unwrap_or(false) {
-                serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
+                serve_harmony_responses_stream(&harmony_ctx, body.clone(), tenant_meta.clone())
+                    .await
             } else {
-                match serve_harmony_responses(&harmony_ctx, body.clone()).await {
+                match serve_harmony_responses(&harmony_ctx, body.clone(), tenant_meta.clone()).await
+                {
                     Ok(response) => axum::Json(response).into_response(),
                     Err(error_response) => error_response,
                 }
@@ -343,6 +361,7 @@ impl GrpcRouter {
                 &self.responses_context,
                 Arc::new(body.clone()),
                 headers.cloned(),
+                tenant_meta.clone(),
                 model_id.to_string(),
             )
             .await
@@ -353,6 +372,7 @@ impl GrpcRouter {
     async fn route_embeddings_impl(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &EmbeddingRequest,
         model_id: &str,
     ) -> Response {
@@ -364,6 +384,7 @@ impl GrpcRouter {
                 headers.cloned(),
                 model_id.to_string(),
                 self.shared_components.clone(),
+                Some(tenant_meta.clone()),
             )
             .await
     }
@@ -372,6 +393,7 @@ impl GrpcRouter {
     async fn route_messages_impl(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &CreateMessageRequest,
         model_id: &str,
     ) -> Response {
@@ -382,6 +404,7 @@ impl GrpcRouter {
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
+        let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.messages_pipeline;
 
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
@@ -397,9 +420,10 @@ impl GrpcRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let tenant_meta = tenant_meta_cloned.clone();
                 async move {
                     pipeline
-                        .execute_messages(request, headers, model_id, components)
+                        .execute_messages(request, headers, model_id, components, Some(tenant_meta))
                         .await
                 }
             },
@@ -425,6 +449,7 @@ impl GrpcRouter {
     async fn route_completion_impl(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &CompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -434,6 +459,7 @@ impl GrpcRouter {
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
+        let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.completion_pipeline;
 
         let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
@@ -448,9 +474,16 @@ impl GrpcRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let tenant_meta = tenant_meta_cloned.clone();
                 async move {
                     pipeline
-                        .execute_completion(request, headers, model_id, components)
+                        .execute_completion(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                        )
                         .await
                 }
             },
@@ -476,6 +509,7 @@ impl GrpcRouter {
     async fn route_classify_impl(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &ClassifyRequest,
         model_id: &str,
     ) -> Response {
@@ -487,6 +521,7 @@ impl GrpcRouter {
                 headers.cloned(),
                 model_id.to_string(),
                 self.shared_components.clone(),
+                Some(tenant_meta.clone()),
             )
             .await
     }
@@ -510,28 +545,34 @@ impl RouterTrait for GrpcRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_generate_impl(headers, body, model_id).await
+        self.route_generate_impl(headers, tenant_meta, body, model_id)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        self.route_chat_impl(headers, tenant_meta, body, model_id)
+            .await
     }
 
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_responses_impl(headers, body, model_id).await
+        self.route_responses_impl(headers, tenant_meta, body, model_id)
+            .await
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
@@ -541,37 +582,45 @@ impl RouterTrait for GrpcRouter {
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.route_embeddings_impl(headers, body, model_id).await
+        self.route_embeddings_impl(headers, tenant_meta, body, model_id)
+            .await
     }
 
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.route_classify_impl(headers, body, model_id).await
+        self.route_classify_impl(headers, tenant_meta, body, model_id)
+            .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_completion_impl(headers, body, model_id).await
+        self.route_completion_impl(headers, tenant_meta, body, model_id)
+            .await
     }
 
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        self.route_messages_impl(headers, body, model_id).await
+        self.route_messages_impl(headers, tenant_meta, body, model_id)
+            .await
     }
 
     fn router_type(&self) -> &'static str {

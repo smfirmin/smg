@@ -363,24 +363,24 @@ impl Bucket {
         }
 
         let worker_cnt = bucket_cnt;
-        let boundary = if worker_cnt == 0 {
-            Vec::new()
-        } else {
-            let gap = self.l_max / worker_cnt;
-            self.l_max = usize::MAX;
-            prefill_worker_urls
-                .iter()
-                .enumerate()
-                .map(|(i, url)| {
-                    let min = i * gap;
-                    let max = if i == worker_cnt - 1 {
-                        self.l_max
-                    } else {
-                        (i + 1) * gap - 1
-                    };
-                    Boundary::new(url.clone(), [min, max])
-                })
-                .collect()
+        let boundary = match self.l_max.checked_div(worker_cnt) {
+            None => Vec::new(),
+            Some(gap) => {
+                self.l_max = usize::MAX;
+                prefill_worker_urls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, url)| {
+                        let min = i * gap;
+                        let max = if i == worker_cnt - 1 {
+                            self.l_max
+                        } else {
+                            (i + 1) * gap - 1
+                        };
+                        Boundary::new(url.clone(), [min, max])
+                    })
+                    .collect()
+            }
         };
 
         self.boundary = boundary;
@@ -562,8 +562,17 @@ impl Bucket {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::worker::HealthCheckConfig;
+
     use super::*;
     use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+    fn no_health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     async fn test_load_balancing_conditions() {
@@ -579,18 +588,21 @@ mod tests {
                 BasicWorkerBuilder::new("http://w1:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w2:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w3:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
         ];
@@ -793,18 +805,21 @@ mod tests {
                 BasicWorkerBuilder::new("http://w1:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w2:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w3:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
         ];
@@ -996,18 +1011,21 @@ mod tests {
                 BasicWorkerBuilder::new("http://w1:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w2:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w3:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
         ];
@@ -1104,18 +1122,21 @@ mod tests {
                 BasicWorkerBuilder::new("http://w1:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w2:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w3:8000")
                     .worker_type(WorkerType::Regular)
                     .api_key("test_api_key")
+                    .health_config(no_health_check())
                     .build(),
             ),
         ];

@@ -6,11 +6,14 @@
 //! - Consistent hashing for request routing
 //! - Partition detection and recovery
 
+mod chunk_assembler;
+mod chunking;
+mod collector;
 mod consistent_hash;
 mod controller;
 mod crdt_kv;
 mod flow_control;
-mod incremental;
+pub mod kv;
 mod metrics;
 mod mtls;
 mod node_state_machine;
@@ -28,7 +31,15 @@ mod tree_ops;
 mod tests;
 
 // Re-export commonly used types
-pub use crdt_kv::{CrdtOrMap, OperationLog};
+pub use crdt_kv::{
+    decode as decode_epoch_count, encode as encode_epoch_count, merge as merge_epoch_max_wins,
+    CrdtOrMap, EpochCount, OperationLog, EPOCH_MAX_WINS_ENCODED_LEN,
+};
+// v2 API
+pub use kv::{
+    CrdtNamespace, DrainHandle, MergeStrategy, MeshKV, StreamConfig, StreamDrainFn,
+    StreamNamespace, StreamRouting, Subscription,
+};
 pub use metrics::init_mesh_metrics;
 pub use mtls::{MTLSConfig, MTLSManager, OptionalMTLSManager};
 pub use partition::PartitionDetector;
