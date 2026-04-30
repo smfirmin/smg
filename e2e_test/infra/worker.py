@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -17,6 +18,7 @@ from .constants import (
     DEFAULT_HOST,
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
+    ENV_VLLM_ENABLE_KV_EVENTS,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     ConnectionMode,
@@ -40,6 +42,8 @@ class Worker:
     mode: ConnectionMode = ConnectionMode.HTTP
     worker_type: WorkerType = WorkerType.REGULAR
     bootstrap_port: int | None = None
+    kv_events_pub_port: int | None = None
+    kv_events_replay_port: int | None = None
     ib_device: str | None = None
     log_dir: str | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
@@ -157,6 +161,10 @@ class Worker:
         release_port(self.port)
         if self.bootstrap_port is not None:
             release_port(self.bootstrap_port)
+        if self.kv_events_pub_port is not None:
+            release_port(self.kv_events_pub_port)
+        if self.kv_events_replay_port is not None:
+            release_port(self.kv_events_replay_port)
 
     def is_alive(self) -> bool:
         """Check if the worker process is still running."""
@@ -259,7 +267,33 @@ class Worker:
         extra = spec.get("vllm_args", [])
         if extra:
             cmd.extend(extra)
+        if entrypoint == "vllm.entrypoints.grpc_server":
+            cmd.extend(self._build_vllm_kv_events_args())
         return cmd
+
+    def _build_vllm_kv_events_args(self) -> list[str]:
+        """Enable KV event streaming for vLLM gRPC workers when requested."""
+        enabled = os.environ.get(ENV_VLLM_ENABLE_KV_EVENTS, "").lower() in ("1", "true", "yes")
+        if not enabled:
+            return []
+
+        if self.kv_events_pub_port is None:
+            self.kv_events_pub_port = get_open_port()
+        if self.kv_events_replay_port is None:
+            self.kv_events_replay_port = get_open_port()
+
+        kv_events_config = json.dumps(
+            {
+                "enable_kv_cache_events": True,
+                "publisher": "zmq",
+                "endpoint": f"tcp://*:{self.kv_events_pub_port}",
+                "replay_endpoint": f"tcp://*:{self.kv_events_replay_port}",
+                "buffer_steps": 10_000,
+                "topic": "",
+            },
+            separators=(",", ":"),
+        )
+        return ["--kv-events-config", kv_events_config]
 
     def _build_trtllm_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build TensorRT-LLM gRPC server command."""

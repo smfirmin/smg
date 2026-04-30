@@ -473,11 +473,88 @@ jobs:
   #   # tp=8, keep disabled for nightly
 
   # ---------------------------------------------------------------------------
+  # KV event benchmark: targeted overnight check for cache-aware vLLM gRPC routing.
+  # ---------------------------------------------------------------------------
+
+  kv-event-benchmark:
+    name: "kv-event-benchmark / vllm"
+    needs: build-wheel
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || github.event.inputs.runtime == 'all' || github.event.inputs.runtime == 'vllm') }}
+    runs-on: 4-gpu-h100
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup vLLM backend
+        uses: ./.github/actions/setup-vllm
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: smg-wheel
+          path: wheel/
+
+      - name: Download Python client types
+        uses: actions/download-artifact@v8
+        with:
+          name: python-client-types
+          path: clients/python/smg_client/types/
+
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh genai-bench
+
+      - name: Pull genai-bench image
+        run: docker pull ${{ env.GENAI_BENCH_IMAGE }}
+
+      - name: Run KV event benchmark
+        env:
+          GPU_TYPE: H100
+          E2E_NIGHTLY: "1"
+          E2E_RUNTIME: vllm
+          E2E_MODEL_TP_OVERRIDES: '{"meta-llama/Llama-3.1-8B-Instruct":1}'
+          E2E_LOG_DIR: nightly_kv_event_logs
+        run: |
+          mkdir -p nightly_kv_event_logs
+          bash scripts/ci_killall_sglang.sh "nuke_gpus"
+
+          ROUTER_LOCAL_MODEL_PATH="/raid/models" \
+            pytest e2e_test/benchmarks/test_kv_event_perf.py \
+              -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-kv-event-benchmark-${{ github.run_id }}
+          path: benchmark_*/
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload worker logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kv-event-logs-${{ github.run_id }}
+          path: nightly_kv_event_logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: bash scripts/ci_killall_sglang.sh "nuke_gpus" || true
+
+  # ---------------------------------------------------------------------------
   # Summary
   # ---------------------------------------------------------------------------
 
   summarize-benchmarks:
-    needs: [single-worker, multi-worker, single-worker-h200]
+    needs: [single-worker, multi-worker, single-worker-h200, kv-event-benchmark]
     runs-on: ubuntu-latest
     if: always()
     permissions:
@@ -494,6 +571,9 @@ jobs:
 
       - name: Install chart dependencies
         run: pip install matplotlib
+
+      - name: Create KV event benchmark summary
+        run: python3 e2e_test/benchmarks/summarize.py .
 
       - name: Create benchmark summary
         run: python3 e2e_test/benchmarks/nightly_summarize.py . --charts-dir nightly_charts
